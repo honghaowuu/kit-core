@@ -45,8 +45,6 @@ fn plan_with_tasks_no_impl_commits_marks_all_pending() {
         "## Tasks\n\n1. **First task** — do something\n2. **Second task** — and another\n",
     );
     commit_all(tmp.path(), "feat: add plan");
-    // Empty spec-sync forces behind=true so we get implement_from_plan.
-    write(tmp.path(), ".jkit/spec-sync", "");
 
     let out = kit().current_dir(tmp.path()).args(["plan-status"]).output().unwrap();
     assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
@@ -85,23 +83,28 @@ fn impl_commits_advance_completed_state() {
 }
 
 #[test]
-fn already_synced_when_spec_sync_matches_head() {
+fn already_synced_when_all_tasks_have_impl_commits() {
     let tmp = TempDir::new().unwrap();
     git_init(tmp.path());
     write(
         tmp.path(),
         ".jkit/2026-04-25-foo/plan.md",
-        "## Tasks\n\n1. **Add filter** — wire it\n",
+        "## Tasks\n\n1. **Add filter** — wire it\n2. **Persist rows** — repo + JPA\n",
     );
     commit_all(tmp.path(), "chore: scaffold plan");
-    let head = sh(tmp.path(), &["rev-parse", "HEAD"]).trim().to_string();
-    write(tmp.path(), ".jkit/spec-sync", &format!("{}\n", head));
+    write(tmp.path(), "a.txt", "a");
+    commit_all(tmp.path(), "feat(impl): wire ValidationFilter");
+    write(tmp.path(), "b.txt", "b");
+    commit_all(tmp.path(), "feat(impl): repo + JPA mapping");
 
     let out = kit().current_dir(tmp.path()).args(["plan-status"]).output().unwrap();
     assert!(out.status.success());
     let v = parse_stdout(&out.stdout);
     assert_eq!(v["recommendation"], "already_synced");
-    assert_eq!(v["spec_sync_behind_head"], false);
+    assert_eq!(v["tasks"][0]["completed"], true);
+    assert_eq!(v["tasks"][1]["completed"], true);
+    assert!(v["next_pending_task_index"].is_null());
+    assert!(v.get("spec_sync_behind_head").is_none());
 }
 
 #[test]

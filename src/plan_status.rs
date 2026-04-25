@@ -28,7 +28,6 @@ struct Output {
     plan_path: Option<String>,
     baseline_sha: Option<String>,
     head_sha: Option<String>,
-    spec_sync_behind_head: bool,
     tasks: Vec<Task>,
     next_pending_task_index: Option<usize>,
     recommendation: &'static str,
@@ -79,7 +78,6 @@ fn compute(cwd: &Path, run_arg: Option<&Path>) -> Result<Output> {
             plan_path: Some(rel(cwd, &plan_path)),
             baseline_sha: None,
             head_sha: None,
-            spec_sync_behind_head: false,
             tasks: Vec::new(),
             next_pending_task_index: None,
             recommendation: REC_NO_PLAN,
@@ -90,27 +88,6 @@ fn compute(cwd: &Path, run_arg: Option<&Path>) -> Result<Output> {
     let head_sha = git::rev_parse_head(cwd).ok();
     let baseline_sha =
         git::first_commit_for_path(cwd, &rel(cwd, &plan_path)).unwrap_or(None);
-
-    // Spec sync behind head?
-    let spec_sync_path = cwd.join(".jkit/spec-sync");
-    let spec_sync_behind_head = if spec_sync_path.is_file() {
-        let content = std::fs::read_to_string(&spec_sync_path)
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-        match (content.is_empty(), head_sha.as_deref()) {
-            (true, _) => true,
-            (false, Some(h)) => content != h,
-            (false, None) => false,
-        }
-    } else {
-        // Missing: behind iff any commits exist after baseline.
-        match (&baseline_sha, &head_sha) {
-            (Some(b), Some(h)) => b != h,
-            (None, Some(_)) => true,
-            _ => false,
-        }
-    };
 
     // Walk impl commits.
     let impl_commits = if let Some(head) = head_sha.as_deref() {
@@ -154,10 +131,11 @@ fn compute(cwd: &Path, run_arg: Option<&Path>) -> Result<Output> {
         .collect();
 
     let next_pending = tasks.iter().find(|t| !t.completed).map(|t| t.index);
+    let all_completed = !tasks.is_empty() && tasks.iter().all(|t| t.completed);
 
     let recommendation = if tasks.is_empty() {
         REC_NO_PLAN
-    } else if !spec_sync_behind_head {
+    } else if all_completed {
         REC_ALREADY_SYNCED
     } else {
         REC_IMPLEMENT
@@ -173,7 +151,6 @@ fn compute(cwd: &Path, run_arg: Option<&Path>) -> Result<Output> {
         plan_path: Some(rel(cwd, &plan_path)),
         baseline_sha,
         head_sha,
-        spec_sync_behind_head,
         tasks,
         next_pending_task_index: if recommendation == REC_IMPLEMENT {
             next_pending
@@ -190,7 +167,6 @@ fn no_plan(run: Option<String>) -> Output {
         plan_path: None,
         baseline_sha: None,
         head_sha: None,
-        spec_sync_behind_head: false,
         tasks: Vec::new(),
         next_pending_task_index: None,
         recommendation: REC_NO_PLAN,
