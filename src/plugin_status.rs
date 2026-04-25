@@ -31,6 +31,8 @@ struct Output {
     skill_name: Option<String>,
     contract_yaml_path: Option<String>,
     sdk: Option<Sdk>,
+    repo_url: Option<String>,
+    issues_url: Option<String>,
     warnings: Vec<String>,
 }
 
@@ -67,6 +69,8 @@ fn compute(cwd: &Path, home: Option<&Path>, name: &str) -> Result<Output> {
             skill_name: None,
             contract_yaml_path: None,
             sdk: None,
+            repo_url: None,
+            issues_url: None,
             warnings: Vec::new(),
         });
     }
@@ -92,6 +96,8 @@ fn compute(cwd: &Path, home: Option<&Path>, name: &str) -> Result<Output> {
     let plugin_json_path = plugin_path.join(".claude-plugin").join("plugin.json");
     let mut plugin_version: Option<String> = None;
     let mut skill_name: Option<String> = None;
+    let mut repo_url: Option<String> = None;
+    let mut issues_url: Option<String> = None;
     if plugin_json_path.is_file() {
         let raw = std::fs::read_to_string(&plugin_json_path)
             .with_context(|| format!("failed to read {}", plugin_json_path.display()))?;
@@ -101,6 +107,11 @@ fn compute(cwd: &Path, home: Option<&Path>, name: &str) -> Result<Output> {
         if plugin_version.is_none() {
             warnings.push("plugin.json missing 'version'".into());
         }
+        repo_url = v.get("repository").and_then(extract_url_field);
+        issues_url = v
+            .get("bugs")
+            .and_then(extract_url_field)
+            .or_else(|| repo_url.as_deref().and_then(derive_github_issues_url));
         // skill name: prefer first entry of skills[]; fall back to bare service name guess.
         if let Some(skills) = v.get("skills").and_then(|x| x.as_array()) {
             if let Some(first) = skills.first() {
@@ -163,8 +174,38 @@ fn compute(cwd: &Path, home: Option<&Path>, name: &str) -> Result<Output> {
         skill_name,
         contract_yaml_path,
         sdk,
+        repo_url,
+        issues_url,
         warnings,
     })
+}
+
+/// Extract a URL from a JSON field that may be either a bare string
+/// (`"https://github.com/foo/bar"`) or an object with a `url` field
+/// (`{"type": "git", "url": "git+https://github.com/foo/bar.git"}`).
+/// Strips `git+` prefix and `.git` suffix to yield a canonical browsable URL.
+fn extract_url_field(v: &serde_json::Value) -> Option<String> {
+    let raw = v
+        .as_str()
+        .map(String::from)
+        .or_else(|| v.get("url").and_then(|x| x.as_str()).map(String::from))?;
+    Some(normalize_repo_url(&raw))
+}
+
+fn normalize_repo_url(s: &str) -> String {
+    let s = s.strip_prefix("git+").unwrap_or(s);
+    let s = s.strip_suffix(".git").unwrap_or(s);
+    s.to_string()
+}
+
+/// Best-effort issues URL derivation for GitHub-hosted repos.
+/// Returns None for non-GitHub hosts; consumers should display `repo_url` instead.
+fn derive_github_issues_url(repo: &str) -> Option<String> {
+    if repo.contains("github.com") {
+        Some(format!("{}/issues", repo))
+    } else {
+        None
+    }
 }
 
 fn candidate_paths(cwd: &Path, home: Option<&Path>, name: &str) -> Vec<(String, PathBuf)> {

@@ -95,6 +95,79 @@ fn project_level_wins_over_user_level() {
 }
 
 #[test]
+fn repository_and_bugs_fields_surface_urls() {
+    let tmp = TempDir::new().unwrap();
+    write(
+        tmp.path(),
+        ".claude/plugins/billing-contract/.claude-plugin/plugin.json",
+        r#"{
+          "name":"billing-contract","version":"1.0.0","skills":["billing"],
+          "repository":{"type":"git","url":"git+https://github.com/acme/billing-contract.git"},
+          "bugs":{"url":"https://acme.example.com/tickets/billing"}
+        }"#,
+    );
+
+    let out = kit()
+        .current_dir(tmp.path())
+        .env("HOME", tmp.path())
+        .args(["plugin-status", "billing"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v = parse_stdout(&out.stdout);
+    assert_eq!(v["repo_url"], "https://github.com/acme/billing-contract");
+    assert_eq!(v["issues_url"], "https://acme.example.com/tickets/billing");
+}
+
+#[test]
+fn issues_url_derived_from_github_repo_when_bugs_absent() {
+    let tmp = TempDir::new().unwrap();
+    write(
+        tmp.path(),
+        ".claude/plugins/billing-contract/.claude-plugin/plugin.json",
+        r#"{
+          "name":"billing-contract","version":"1.0.0","skills":["billing"],
+          "repository":"https://github.com/acme/billing-contract"
+        }"#,
+    );
+
+    let out = kit()
+        .current_dir(tmp.path())
+        .env("HOME", tmp.path())
+        .args(["plugin-status", "billing"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v = parse_stdout(&out.stdout);
+    assert_eq!(v["repo_url"], "https://github.com/acme/billing-contract");
+    assert_eq!(v["issues_url"], "https://github.com/acme/billing-contract/issues");
+}
+
+#[test]
+fn no_issues_url_for_non_github_repo_when_bugs_absent() {
+    let tmp = TempDir::new().unwrap();
+    write(
+        tmp.path(),
+        ".claude/plugins/billing-contract/.claude-plugin/plugin.json",
+        r#"{
+          "name":"billing-contract","version":"1.0.0","skills":["billing"],
+          "repository":"https://gitlab.example.com/acme/billing-contract"
+        }"#,
+    );
+
+    let out = kit()
+        .current_dir(tmp.path())
+        .env("HOME", tmp.path())
+        .args(["plugin-status", "billing"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v = parse_stdout(&out.stdout);
+    assert_eq!(v["repo_url"], "https://gitlab.example.com/acme/billing-contract");
+    assert!(v["issues_url"].is_null());
+}
+
+#[test]
 fn missing_contract_yaml_surfaces_warning() {
     let tmp = TempDir::new().unwrap();
     write(
