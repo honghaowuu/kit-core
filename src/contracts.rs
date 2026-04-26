@@ -46,6 +46,24 @@ pub enum ContractsCmd {
         #[arg(long)]
         marketplace_name: Option<String>,
     },
+    /// Create a fresh marketplace repo on GitHub via `gh repo create`,
+    /// seed it with an empty `.claude-plugin/marketplace.json`, push the
+    /// init commit. Idempotent: returns `created: false` when the repo
+    /// already exists (won't reseed an existing marketplace).
+    BootstrapMarketplace {
+        /// Marketplace git URL — same format as --marketplace-repo.
+        #[arg(long)]
+        url: String,
+        /// Short marketplace name written into marketplace.json.
+        #[arg(long)]
+        name: String,
+        /// Optional GitHub repo description.
+        #[arg(long)]
+        description: Option<String>,
+        /// Pass --public to create a public repo. Default is private.
+        #[arg(long, default_value_t = false)]
+        public: bool,
+    },
 }
 
 pub fn run(cmd: ContractsCmd) -> Result<ExitCode> {
@@ -59,6 +77,12 @@ pub fn run(cmd: ContractsCmd) -> Result<ExitCode> {
             marketplace_repo,
             marketplace_name,
         } => install(services, marketplace_repo, marketplace_name),
+        ContractsCmd::BootstrapMarketplace {
+            url,
+            name,
+            description,
+            public,
+        } => bootstrap_marketplace(&url, &name, description.as_deref(), public),
     }
 }
 
@@ -182,6 +206,232 @@ pub fn install(
     envelope::print_ok(serde_json::to_value(&out)?)
 }
 
+#[derive(Serialize, Debug)]
+struct BootstrapOut {
+    url: String,
+    owner_repo: String,
+    /// True iff this invocation actually created the GitHub repo.
+    /// False means the repo already existed (idempotent no-op on the
+    /// gh-create side; the seed push is also skipped).
+    created: bool,
+    /// True iff the seed marketplace.json + init commit were pushed.
+    /// False when the repo already had any commits (don't clobber).
+    seeded: bool,
+}
+
+pub fn bootstrap_marketplace(
+    url: &str,
+    name: &str,
+    description: Option<&str>,
+    public: bool,
+) -> Result<ExitCode> {
+    let owner_repo = parse_github_owner_repo(url).ok_or_else(|| {
+        anyhow!(
+            "couldn't parse a GitHub owner/repo from URL '{}' — bootstrap-marketplace only supports GitHub-hosted repos",
+            url
+        )
+    })?;
+
+    // Probe existing state via gh.
+    if !command_exists("gh") {
+        return Err(anyhow!(
+            "`gh` CLI not on PATH — install GitHub CLI to use bootstrap-marketplace"
+        ));
+    }
+
+    let already_exists = gh_repo_exists(&owner_repo)?;
+
+    let mut created = false;
+    if !already_exists {
+        let desc = description
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("Service contract marketplace for {}", name));
+        let visibility = if public { "--public" } else { "--private" };
+        let out = Command::new("gh")
+            .args([
+                "repo",
+                "create",
+                &owner_repo,
+                visibility,
+                "--description",
+                &desc,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .context("invoking gh repo create")?;
+        if !out.status.success() {
+            return Err(anyhow!(
+                "`gh repo create {} {}` failed: {}",
+                owner_repo,
+                visibility,
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        created = true;
+    }
+
+    // Seed step: clone, write marketplace.json if absent, init commit, push.
+    // Skip when the repo already has commits — we don't want to overwrite an
+    // existing marketplace just because the user re-ran us.
+    let seeded = seed_empty_marketplace(url, name)?;
+
+    let out = BootstrapOut {
+        url: url.to_string(),
+        owner_repo,
+        created,
+        seeded,
+    };
+    envelope::print_ok(serde_json::to_value(&out)?)
+}
+
+/// Try `gh repo view`. Returns Ok(true) if exists, Ok(false) if 404.
+/// Other failures (auth, network) bubble up so the skill can surface them.
+fn gh_repo_exists(owner_repo: &str) -> Result<bool> {
+    let out = Command::new("gh")
+        .args(["repo", "view", owner_repo, "--json", "name"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .context("invoking gh repo view")?;
+    if out.status.success() {
+        return Ok(true);
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr).to_lowercase();
+    if stderr.contains("could not resolve") || stderr.contains("404") || stderr.contains("not found") {
+        return Ok(false);
+    }
+    Err(anyhow!(
+        "`gh repo view {}` failed: {}",
+        owner_repo,
+        stderr.trim()
+    ))
+}
+
+/// Clone the (possibly-fresh) repo, write `.claude-plugin/marketplace.json`
+/// with an empty plugins array, init commit, push. Returns Ok(true) if the
+/// seed actually happened, Ok(false) if the repo already had commits and
+/// we left it alone.
+fn seed_empty_marketplace(url: &str, name: &str) -> Result<bool> {
+    let tmp = tempfile::Builder::new()
+        .prefix("kit-bootstrap-")
+        .tempdir()
+        .context("creating tempdir for seed clone")?;
+
+    // A fresh `gh repo create` repo has no commits — `git clone` of it
+    // succeeds but `tmp` ends up with just `.git`. We init manually if
+    // clone produces an empty repo, since the empty-clone case isn't
+    // uniformly handled across git versions.
+    let clone = Command::new("git")
+        .args(["clone", "--quiet", url, tmp.path().to_string_lossy().as_ref()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .context("git clone for seed")?;
+
+    let work = tmp.path();
+    if !clone.status.success() {
+        // Some git versions fail on cloning an empty repo — fall back to
+        // init + remote add so the push step still works.
+        std::fs::create_dir_all(work)?;
+        run_git_q(work, &["init", "-q", "-b", "main"])?;
+        run_git_q(work, &["remote", "add", "origin", url])?;
+    }
+
+    // Already-seeded check: any existing commit on the default branch.
+    let head = Command::new("git")
+        .current_dir(work)
+        .args(["rev-parse", "HEAD"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let already_has_commits = head.map(|s| s.success()).unwrap_or(false);
+    if already_has_commits {
+        return Ok(false);
+    }
+
+    let mp_path = work.join(".claude-plugin").join("marketplace.json");
+    std::fs::create_dir_all(mp_path.parent().unwrap())?;
+    let body = serde_json::json!({
+        "name": name,
+        "plugins": [],
+    });
+    std::fs::write(&mp_path, serde_json::to_string_pretty(&body)? + "\n")?;
+
+    run_git_q(work, &["add", ".claude-plugin/marketplace.json"])?;
+    run_git_q(
+        work,
+        &[
+            "-c",
+            "user.email=jkit@local",
+            "-c",
+            "user.name=jkit",
+            "commit",
+            "-q",
+            "-m",
+            "init marketplace",
+        ],
+    )?;
+    run_git_q(work, &["push", "-q", "-u", "origin", "HEAD:main"])?;
+    Ok(true)
+}
+
+fn run_git_q(cwd: &Path, args: &[&str]) -> Result<()> {
+    let out = Command::new("git")
+        .current_dir(cwd)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .with_context(|| format!("git {}", args.join(" ")))?;
+    if !out.status.success() {
+        return Err(anyhow!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+/// Strip a Git URL down to `owner/repo` for `gh`. Handles the same forms
+/// as the bash gh_owner_repo helper used to: SSH (`git@github.com:o/r.git`),
+/// HTTPS (`https://github.com/o/r[.git]`), and bare `owner/repo`.
+/// Returns None for non-GitHub or unparseable inputs.
+fn parse_github_owner_repo(url: &str) -> Option<String> {
+    let s = url.strip_prefix("git@github.com:").unwrap_or(url);
+    let s = s.strip_prefix("https://github.com/").unwrap_or(s);
+    let s = s.strip_prefix("http://github.com/").unwrap_or(s);
+    let s = s.strip_suffix(".git").unwrap_or(s);
+    // Reject anything that still looks like a URL, an SSH spec, or that
+    // doesn't have exactly one '/' (owner/repo).
+    if s.contains("://")
+        || s.contains('@')
+        || s.contains(':')
+        || s.matches('/').count() != 1
+        || s.is_empty()
+    {
+        return None;
+    }
+    Some(s.to_string())
+}
+
+fn command_exists(name: &str) -> bool {
+    Command::new("sh")
+        .args(["-lc", &format!("command -v {} >/dev/null 2>&1", name)])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 /// Returns `(marketplace_repo, marketplace_name)`, persisting any non-None
 /// override back into `.jkit/contract.json`.
 fn resolve_marketplace_config(
@@ -204,27 +454,45 @@ fn resolve_marketplace_config(
                 .and_then(|v| v.as_str())
                 .map(str::to_string)
         })
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            anyhow!(
-                "marketplaceRepo missing — pass --marketplace-repo or set it in {}",
-                CONTRACT_JSON
-            )
-        })?;
-
+        .filter(|s| !s.is_empty());
     let name = name_arg
         .or_else(|| {
             cfg.get("marketplaceName")
                 .and_then(|v| v.as_str())
                 .map(str::to_string)
         })
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            anyhow!(
-                "marketplaceName missing — pass --marketplace-name or set it in {}",
+        .filter(|s| !s.is_empty());
+
+    // Coded errors so the /install-contracts skill can prompt the user
+    // for the missing values and retry, rather than parsing the message.
+    let repo = match repo {
+        Some(r) => r,
+        None => {
+            let msg = format!(
+                "marketplaceRepo not set — pass --marketplace-repo or set it in {}",
                 CONTRACT_JSON
-            )
-        })?;
+            );
+            envelope::print_err_coded(
+                "MARKETPLACE_REPO_MISSING",
+                &msg,
+                Some("Ask the user for the marketplace git URL (e.g. git@github.com:org/marketplace.git) and retry with --marketplace-repo"),
+            );
+        }
+    };
+    let name = match name {
+        Some(n) => n,
+        None => {
+            let msg = format!(
+                "marketplaceName not set — pass --marketplace-name or set it in {}",
+                CONTRACT_JSON
+            );
+            envelope::print_err_coded(
+                "MARKETPLACE_NAME_MISSING",
+                &msg,
+                Some("Ask the user for a short marketplace name (e.g. org-marketplace) and retry with --marketplace-name"),
+            );
+        }
+    };
 
     // Persist (idempotent: only writes if values differ).
     let cfg_obj = cfg.as_object_mut().expect("ensured object above");
@@ -271,6 +539,21 @@ fn build_catalog_from_remote(repo: &str, name: &str) -> Result<(Catalog, tempfil
         .context("invoking git clone")?;
     if !clone_status.status.success() {
         let stderr = String::from_utf8_lossy(&clone_status.stderr).trim().to_string();
+        // Distinguish "repo doesn't exist" from other clone failures
+        // (network, auth, permission). The skill auto-recovers from
+        // NOT_FOUND by offering to gh-create; other errors surface as-is.
+        if looks_like_repo_not_found(&stderr) {
+            let msg = format!("marketplace repo '{}' not found", repo);
+            let hint = format!(
+                "Ask the user to create it; on confirm, call `kit contracts bootstrap-marketplace --url '{}' --name '{}'`",
+                repo, name
+            );
+            envelope::print_err_coded(
+                "MARKETPLACE_REPO_NOT_FOUND",
+                &msg,
+                Some(&hint),
+            );
+        }
         return Err(anyhow!(
             "git clone {} failed: {}",
             repo,
@@ -281,8 +564,27 @@ fn build_catalog_from_remote(repo: &str, name: &str) -> Result<(Catalog, tempfil
     // Marketplace lives at .claude-plugin/marketplace.json per the
     // claude-code marketplace convention.
     let mp_path = tmp.path().join(".claude-plugin").join("marketplace.json");
-    let mp_text = std::fs::read_to_string(&mp_path)
-        .with_context(|| format!("reading {}", mp_path.display()))?;
+    let mp_text = match std::fs::read_to_string(&mp_path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let msg = format!(
+                "clone of {} succeeded but .claude-plugin/marketplace.json is absent (empty repo)",
+                repo
+            );
+            let hint = format!(
+                "Ask the user to seed the marketplace; on confirm, call `kit contracts bootstrap-marketplace --url '{}' --name '{}'` (it's idempotent — won't re-create the repo)",
+                repo, name
+            );
+            envelope::print_err_coded(
+                "MARKETPLACE_JSON_MISSING",
+                &msg,
+                Some(&hint),
+            );
+        }
+        Err(e) => {
+            return Err(anyhow!("reading {}: {}", mp_path.display(), e));
+        }
+    };
     let mp: Value = serde_json::from_str(&mp_text)
         .with_context(|| format!("parsing {}", mp_path.display()))?;
     let plugins = mp
@@ -425,6 +727,18 @@ fn run_claude(args: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// Heuristic match on git clone stderr to distinguish "repo doesn't exist"
+/// from other failures (network, auth). Covers the common error texts
+/// from GitHub/GitLab/git itself. Conservative: prefers false negatives
+/// (caller falls through to generic error) over false positives.
+fn looks_like_repo_not_found(stderr: &str) -> bool {
+    let lower = stderr.to_lowercase();
+    lower.contains("repository not found")
+        || lower.contains("could not read from remote repository")
+        || lower.contains("does not appear to be a git repository")
+        || (lower.contains("404") && lower.contains("not found"))
+}
+
 fn now_iso8601() -> String {
     // Minimal RFC3339-ish UTC timestamp without a chrono dep — kit-core
     // doesn't use chrono and pulling it in just for this is overkill.
@@ -485,5 +799,33 @@ mod tests {
     fn epoch_zero_is_unix_epoch() {
         let (y, mo, d, h, mi, s) = epoch_to_ymdhms(0);
         assert_eq!((y, mo, d, h, mi, s), (1970, 1, 1, 0, 0, 0));
+    }
+
+    #[test]
+    fn parse_github_owner_repo_handles_url_forms() {
+        assert_eq!(parse_github_owner_repo("git@github.com:org/marketplace.git").as_deref(), Some("org/marketplace"));
+        assert_eq!(parse_github_owner_repo("https://github.com/org/marketplace.git").as_deref(), Some("org/marketplace"));
+        assert_eq!(parse_github_owner_repo("https://github.com/org/marketplace").as_deref(), Some("org/marketplace"));
+        assert_eq!(parse_github_owner_repo("http://github.com/org/marketplace").as_deref(), Some("org/marketplace"));
+        assert_eq!(parse_github_owner_repo("org/marketplace").as_deref(), Some("org/marketplace"));
+    }
+
+    #[test]
+    fn parse_github_owner_repo_rejects_non_github() {
+        assert!(parse_github_owner_repo("git@gitlab.com:org/foo.git").is_none());
+        assert!(parse_github_owner_repo("https://gitlab.com/org/foo.git").is_none());
+        assert!(parse_github_owner_repo("").is_none());
+        assert!(parse_github_owner_repo("just-a-name").is_none());
+        assert!(parse_github_owner_repo("too/many/segments").is_none());
+    }
+
+    #[test]
+    fn repo_not_found_classifier() {
+        assert!(looks_like_repo_not_found("ERROR: Repository not found."));
+        assert!(looks_like_repo_not_found("fatal: could not read from remote repository"));
+        assert!(looks_like_repo_not_found("remote: 404 Not Found"));
+        assert!(!looks_like_repo_not_found("Permission denied (publickey)."));
+        assert!(!looks_like_repo_not_found("network is unreachable"));
+        assert!(!looks_like_repo_not_found(""));
     }
 }
