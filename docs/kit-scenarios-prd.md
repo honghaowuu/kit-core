@@ -106,6 +106,7 @@ kit scenarios skip --run <dir> <domain> <id>
 | `api-spec.yaml` missing | Exit 1 — sync requires a spec |
 | `test-scenarios.yaml` missing | Create it with derived entries |
 | `oneOf` / `anyOf` body schemas | Apply to each branch independently; dedupe by `(endpoint, id)` |
+| Body or schema is a `$ref` to `#/components/...` | Resolved against `components.schemas` / `components.requestBodies`; cycles are guarded by a visited set |
 
 ### Output formatting
 

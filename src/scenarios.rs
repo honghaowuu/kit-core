@@ -2,7 +2,8 @@ use anyhow::{anyhow, Context, Result};
 use clap::Subcommand;
 use heck::ToKebabCase;
 use openapiv3::{
-    OpenAPI, Operation, Parameter, ReferenceOr, RequestBody, Response, Schema, SchemaKind, Type,
+    Components, OpenAPI, Operation, Parameter, ReferenceOr, RequestBody, Response, Schema,
+    SchemaKind, Type,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -388,6 +389,7 @@ fn yaml_scalar(s: &str) -> String {
 pub fn derive_scenarios(spec: &OpenAPI) -> Vec<ScenarioEntry> {
     let mut out: Vec<ScenarioEntry> = Vec::new();
     let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+    let components = spec.components.as_ref();
 
     let push = |out: &mut Vec<ScenarioEntry>,
                     seen: &mut BTreeSet<(String, String)>,
@@ -422,7 +424,7 @@ pub fn derive_scenarios(spec: &OpenAPI) -> Vec<ScenarioEntry> {
             );
 
             // Required body fields
-            for (field, _) in required_body_fields(op) {
+            for (field, _) in required_body_fields(op, components) {
                 let id = format!("validation-{}-missing", field.to_kebab_case());
                 let desc = format!("missing required field '{}' → 4xx", field);
                 push(&mut out, &mut seen, &endpoint, id, desc);
@@ -545,46 +547,95 @@ fn required_params(op: &Operation) -> Vec<(String, String)> {
     v
 }
 
-fn required_body_fields(op: &Operation) -> Vec<(String, ())> {
+fn required_body_fields(
+    op: &Operation,
+    components: Option<&Components>,
+) -> Vec<(String, ())> {
     let Some(body_ref) = &op.request_body else { return Vec::new() };
     let body: &RequestBody = match body_ref {
         ReferenceOr::Item(b) => b,
-        ReferenceOr::Reference { .. } => return Vec::new(),
+        ReferenceOr::Reference { reference } => match resolve_request_body_ref(reference, components) {
+            Some(b) => b,
+            None => return Vec::new(),
+        },
     };
     let mut fields: BTreeSet<String> = BTreeSet::new();
+    let mut visited: BTreeSet<String> = BTreeSet::new();
     for (_ct, mt) in &body.content {
         let Some(schema_ref) = &mt.schema else { continue };
-        let schema = match schema_ref {
-            ReferenceOr::Item(s) => s,
-            ReferenceOr::Reference { .. } => continue,
-        };
-        collect_required_fields(schema, &mut fields);
+        collect_required_fields_ref(schema_ref, components, &mut fields, &mut visited);
     }
     fields.into_iter().map(|f| (f, ())).collect()
 }
 
-fn collect_required_fields(schema: &Schema, out: &mut BTreeSet<String>) {
+fn collect_required_fields_ref(
+    schema_ref: &ReferenceOr<Schema>,
+    components: Option<&Components>,
+    out: &mut BTreeSet<String>,
+    visited: &mut BTreeSet<String>,
+) {
+    match schema_ref {
+        ReferenceOr::Item(s) => collect_required_fields(s, components, out, visited),
+        ReferenceOr::Reference { reference } => {
+            if !visited.insert(reference.clone()) {
+                return;
+            }
+            if let Some(s) = resolve_schema_ref(reference, components) {
+                collect_required_fields(s, components, out, visited);
+            }
+        }
+    }
+}
+
+fn collect_required_fields(
+    schema: &Schema,
+    components: Option<&Components>,
+    out: &mut BTreeSet<String>,
+    visited: &mut BTreeSet<String>,
+) {
     match &schema.schema_kind {
         SchemaKind::Type(Type::Object(obj)) => {
             for r in &obj.required {
                 out.insert(r.clone());
             }
+            // allOf-style composition is sometimes spelled as object + ref'd
+            // properties; nothing else to recurse into here.
         }
         SchemaKind::OneOf { one_of } | SchemaKind::AnyOf { any_of: one_of } => {
             for branch in one_of {
-                if let ReferenceOr::Item(s) = branch {
-                    collect_required_fields(s, out);
-                }
+                collect_required_fields_ref(branch, components, out, visited);
             }
         }
         SchemaKind::AllOf { all_of } => {
             for branch in all_of {
-                if let ReferenceOr::Item(s) = branch {
-                    collect_required_fields(s, out);
-                }
+                collect_required_fields_ref(branch, components, out, visited);
             }
         }
         _ => {}
+    }
+}
+
+fn resolve_schema_ref<'a>(
+    reference: &str,
+    components: Option<&'a Components>,
+) -> Option<&'a Schema> {
+    let name = reference.strip_prefix("#/components/schemas/")?;
+    let comp = components?;
+    match comp.schemas.get(name)? {
+        ReferenceOr::Item(s) => Some(s),
+        ReferenceOr::Reference { reference } => resolve_schema_ref(reference, Some(comp)),
+    }
+}
+
+fn resolve_request_body_ref<'a>(
+    reference: &str,
+    components: Option<&'a Components>,
+) -> Option<&'a RequestBody> {
+    let name = reference.strip_prefix("#/components/requestBodies/")?;
+    let comp = components?;
+    match comp.request_bodies.get(name)? {
+        ReferenceOr::Item(b) => Some(b),
+        ReferenceOr::Reference { reference } => resolve_request_body_ref(reference, Some(comp)),
     }
 }
 
@@ -665,6 +716,80 @@ paths:
         assert!(ids.contains(&"auth-missing-token"));
         assert!(ids.contains(&"business-duplicate-idempotency-key"));
         assert!(ids.contains(&"not-found"));
+    }
+
+    #[test]
+    fn validation_required_body_field_via_ref() {
+        let spec = parse(
+            r#"
+openapi: 3.0.3
+info: {title: x, version: '1'}
+paths:
+  /a:
+    post:
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateInvoice'
+      responses:
+        '201': {description: created}
+components:
+  schemas:
+    CreateInvoice:
+      type: object
+      required: [customerId, amount]
+      properties:
+        customerId: {type: string}
+        amount: {type: number}
+"#,
+        );
+        let s = derive_scenarios(&spec);
+        let ids: Vec<&str> = s.iter().map(|e| e.id.as_str()).collect();
+        assert!(
+            ids.contains(&"validation-customer-id-missing"),
+            "got: {:?}",
+            ids
+        );
+        assert!(ids.contains(&"validation-amount-missing"), "got: {:?}", ids);
+    }
+
+    #[test]
+    fn validation_required_body_field_via_allof_with_ref() {
+        let spec = parse(
+            r#"
+openapi: 3.0.3
+info: {title: x, version: '1'}
+paths:
+  /a:
+    post:
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/Base'
+                - type: object
+                  required: [extra]
+                  properties:
+                    extra: {type: string}
+      responses:
+        '201': {description: created}
+components:
+  schemas:
+    Base:
+      type: object
+      required: [baseId]
+      properties:
+        baseId: {type: string}
+"#,
+        );
+        let s = derive_scenarios(&spec);
+        let ids: Vec<&str> = s.iter().map(|e| e.id.as_str()).collect();
+        assert!(ids.contains(&"validation-base-id-missing"), "got: {:?}", ids);
+        assert!(ids.contains(&"validation-extra-missing"), "got: {:?}", ids);
     }
 
     #[test]
