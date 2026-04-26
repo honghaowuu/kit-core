@@ -113,6 +113,87 @@ fn already_synced_when_all_tasks_have_impl_commits() {
 }
 
 #[test]
+fn snapshot_taken_at_first_impl_commit_no_drift() {
+    let tmp = TempDir::new().unwrap();
+    git_init(tmp.path());
+    write(
+        tmp.path(),
+        ".jkit/2026-04-25-foo/plan.md",
+        "## Tasks\n\n1. **A** — x\n2. **B** — y\n",
+    );
+    commit_all(tmp.path(), "chore: scaffold plan");
+    write(tmp.path(), "a.txt", "a");
+    commit_all(tmp.path(), "feat(impl): A");
+
+    let out = kit().current_dir(tmp.path()).args(["plan-status"]).output().unwrap();
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let v = parse_stdout(&out.stdout);
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["plan_edited_mid_flight"], false);
+    assert!(v["plan_snapshot_sha256"].as_str().is_some());
+    assert_eq!(v["recommendation"], "implement_from_plan");
+
+    // The snapshot file should exist on disk.
+    assert!(tmp.path().join(".jkit/2026-04-25-foo/.plan-snapshot.json").is_file());
+}
+
+#[test]
+fn snapshot_detects_plan_edited_mid_flight() {
+    let tmp = TempDir::new().unwrap();
+    git_init(tmp.path());
+    write(
+        tmp.path(),
+        ".jkit/2026-04-25-foo/plan.md",
+        "## Tasks\n\n1. **A** — x\n2. **B** — y\n3. **C** — z\n",
+    );
+    commit_all(tmp.path(), "chore: scaffold plan");
+    write(tmp.path(), "a.txt", "a");
+    commit_all(tmp.path(), "feat(impl): A");
+
+    // First call snapshots plan.md.
+    let out = kit().current_dir(tmp.path()).args(["plan-status"]).output().unwrap();
+    assert!(out.status.success());
+
+    // Edit plan.md (delete task B, renumber).
+    write(
+        tmp.path(),
+        ".jkit/2026-04-25-foo/plan.md",
+        "## Tasks\n\n1. **A** — x\n2. **C** — z\n",
+    );
+
+    // Second call should detect drift.
+    let out = kit().current_dir(tmp.path()).args(["plan-status"]).output().unwrap();
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let v = parse_stdout(&out.stdout);
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["plan_edited_mid_flight"], true);
+    assert_eq!(v["recommendation"], "plan_edited_mid_flight");
+    // next_pending_task_index is suppressed when we can't trust matching.
+    assert!(v["next_pending_task_index"].is_null());
+}
+
+#[test]
+fn snapshot_not_taken_before_first_impl_commit() {
+    let tmp = TempDir::new().unwrap();
+    git_init(tmp.path());
+    write(
+        tmp.path(),
+        ".jkit/2026-04-25-foo/plan.md",
+        "## Tasks\n\n1. **A** — x\n",
+    );
+    commit_all(tmp.path(), "chore: scaffold plan");
+
+    let out = kit().current_dir(tmp.path()).args(["plan-status"]).output().unwrap();
+    assert!(out.status.success());
+    let v = parse_stdout(&out.stdout);
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["plan_edited_mid_flight"], false);
+    assert!(v["plan_snapshot_sha256"].is_null());
+    // Plan can be edited freely pre-impl — no drift recorded yet.
+    assert!(!tmp.path().join(".jkit/2026-04-25-foo/.plan-snapshot.json").exists());
+}
+
+#[test]
 fn run_arg_invalid_exits_non_zero() {
     let tmp = TempDir::new().unwrap();
     git_init(tmp.path());
