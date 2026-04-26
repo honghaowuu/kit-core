@@ -19,13 +19,31 @@ fn parse_stdout(bytes: &[u8]) -> Value {
 /// list of (name, description) plugin entries. Returns the path as a
 /// file:// URL safe to pass to `git clone`.
 fn make_marketplace_repo(path: &Path, plugins: &[(&str, &str)]) -> String {
+    let with_versions: Vec<(&str, &str, Option<&str>)> =
+        plugins.iter().map(|(n, d)| (*n, *d, None)).collect();
+    make_marketplace_repo_versioned(path, &with_versions)
+}
+
+/// Like make_marketplace_repo but lets each plugin entry carry a version
+/// (the field added by F.1). Used to exercise F.2's latest_version
+/// propagation into the local catalog.
+fn make_marketplace_repo_versioned(
+    path: &Path,
+    plugins: &[(&str, &str, Option<&str>)],
+) -> String {
     sh(path, &["init", "-q", "-b", "main"]);
     sh(path, &["config", "user.email", "test@local"]);
     sh(path, &["config", "user.name", "test"]);
     sh(path, &["config", "commit.gpgsign", "false"]);
     let plugin_arr: Vec<_> = plugins
         .iter()
-        .map(|(n, d)| serde_json::json!({"name": n, "description": d}))
+        .map(|(n, d, v)| {
+            let mut o = serde_json::json!({"name": n, "description": d});
+            if let Some(ver) = v {
+                o["version"] = serde_json::Value::String(ver.to_string());
+            }
+            o
+        })
         .collect();
     let mp = serde_json::json!({
         "name": "test-marketplace",
@@ -221,6 +239,52 @@ fn install_with_no_services_commits_refresh_subject() {
         v["commit_subject"].as_str().unwrap(),
         "chore: refresh marketplace catalog"
     );
+}
+
+#[test]
+fn refresh_catalog_propagates_latest_version_from_marketplace() {
+    let mp_dir = TempDir::new().unwrap();
+    let url = make_marketplace_repo_versioned(
+        mp_dir.path(),
+        &[
+            ("billing-contract", "Billing", Some("1.5.0")),
+            ("legacy-contract", "Pre-versioning", None),
+        ],
+    );
+    let work = TempDir::new().unwrap();
+    git_init(work.path());
+
+    let out = kit()
+        .current_dir(work.path())
+        .args([
+            "contracts",
+            "refresh-catalog",
+            "--marketplace-repo",
+            &url,
+            "--marketplace-name",
+            "test-mp",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+
+    // Read the on-disk catalog and verify latest_version was propagated
+    // from the marketplace plugin entry, with serde's
+    // skip_serializing_if dropping it for the legacy entry.
+    let catalog_text =
+        std::fs::read_to_string(work.path().join(".jkit/marketplace-catalog.json")).unwrap();
+    let cv: Value = serde_json::from_str(&catalog_text).unwrap();
+    let contracts = cv["contracts"].as_array().unwrap();
+    let billing = contracts
+        .iter()
+        .find(|c| c["name"] == "billing-contract")
+        .unwrap();
+    assert_eq!(billing["latest_version"], "1.5.0");
+    let legacy = contracts
+        .iter()
+        .find(|c| c["name"] == "legacy-contract")
+        .unwrap();
+    assert!(legacy.get("latest_version").is_none(), "legacy entry should omit latest_version");
 }
 
 #[test]

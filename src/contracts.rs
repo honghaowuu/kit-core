@@ -66,6 +66,12 @@ pub fn run(cmd: ContractsCmd) -> Result<ExitCode> {
 struct CatalogContract {
     name: String,
     description: String,
+    /// Version of the contract published to the marketplace, when known.
+    /// Propagated from `marketplace.json`'s plugin entry (written by
+    /// `kit contract publish` — see F.1). `kit plugin-status` compares
+    /// this to the locally installed plugin.json to compute drift.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    latest_version: Option<String>,
 }
 
 #[derive(Serialize, Debug)]
@@ -293,7 +299,15 @@ fn build_catalog_from_remote(repo: &str, name: &str) -> Result<(Catalog, tempfil
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            Some(CatalogContract { name, description })
+            let latest_version = p
+                .get("version")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            Some(CatalogContract {
+                name,
+                description,
+                latest_version,
+            })
         })
         .collect();
 
