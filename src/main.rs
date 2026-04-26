@@ -4,6 +4,7 @@ use std::process::ExitCode;
 mod contract;
 mod envelope;
 mod git;
+mod lockfile;
 mod plan_status;
 mod plugin_status;
 mod scenarios;

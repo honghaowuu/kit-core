@@ -194,12 +194,20 @@ pub fn publish(service: &str, confirmed: bool, no_commit: bool) -> Result<ExitCo
                 if let Err(e) = run_claude_marketplace_update(&marketplace_name) {
                     blocking.push(format!("`claude plugin marketplace update` failed: {}", e));
                 }
-                // 4d. Write catalog.
-                let cp = cwd.join(".jkit").join("marketplace-catalog.json");
-                if let Err(e) = std::fs::write(
-                    &cp,
-                    serde_json::to_string_pretty(&catalog)? + "\n",
-                ) {
+                // 4d. Write catalog. Lock `.jkit/` so two concurrent
+                // `kit contract publish` invocations can't lose each other's
+                // catalog updates; atomic_write guarantees readers never see
+                // a half-written file.
+                let jkit_dir = cwd.join(".jkit");
+                let cp = jkit_dir.join("marketplace-catalog.json");
+                let lock_result = crate::lockfile::lock_file_in(&jkit_dir, "marketplace-catalog");
+                let write_result = lock_result.and_then(|_lock| {
+                    crate::lockfile::atomic_write(
+                        &cp,
+                        (serde_json::to_string_pretty(&catalog)? + "\n").as_bytes(),
+                    )
+                });
+                if let Err(e) = write_result {
                     blocking.push(format!("failed to write catalog: {}", e));
                 } else {
                     catalog_path = Some(cp);
