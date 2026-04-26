@@ -184,9 +184,14 @@ pub fn publish(service: &str, confirmed: bool, no_commit: bool) -> Result<ExitCo
 
     let mut catalog_path: Option<PathBuf> = None;
 
+    // Read the published version from the staged plugin.json so the
+    // marketplace entry can record it. Best-effort: missing/unparseable
+    // file just skips the version field rather than blocking publish.
+    let staged_version = read_staged_version(&stage_dir);
+
     if contract_pushed {
         // 4b. Update marketplace.
-        match update_marketplace(&marketplace_repo, &marketplace_name, service, &contract_repo) {
+        match update_marketplace(&marketplace_repo, &marketplace_name, service, &contract_repo, staged_version.as_deref()) {
             Ok((sha, catalog)) => {
                 marketplace_pushed = true;
                 marketplace_sha = Some(sha);
@@ -401,11 +406,21 @@ fn push_contract_repo(stage: &Path, repo: &str, service: &str) -> Result<String>
     Ok(sha)
 }
 
+/// Read `version` from the staged contract's `.claude-plugin/plugin.json`.
+/// Best-effort — missing file or invalid JSON returns None.
+fn read_staged_version(stage_dir: &Path) -> Option<String> {
+    let p = stage_dir.join(".claude-plugin").join("plugin.json");
+    let text = std::fs::read_to_string(&p).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    v.get("version").and_then(|x| x.as_str()).map(str::to_string)
+}
+
 fn update_marketplace(
     repo: &str,
     name: &str,
     service: &str,
     contract_repo: &str,
+    version: Option<&str>,
 ) -> Result<(String, serde_json::Value)> {
     let tmp = tempdir_in_temp("kit-marketplace")?;
     let clone = run_capture_no_dir(&["clone", "--depth", "1", repo, tmp.to_string_lossy().as_ref()]);
@@ -431,14 +446,25 @@ fn update_marketplace(
         .ok_or_else(|| anyhow!("marketplace.json: 'plugins' must be an array"))?;
 
     let plugin_name = format!("{}-contract", service);
-    let already = plugins.iter().any(|p| {
-        p.get("name").and_then(|x| x.as_str()) == Some(&plugin_name)
+    // Build the desired entry. Always include version when known so the
+    // marketplace becomes the canonical source of truth for "what's the
+    // latest published version" — consumers' refresh-catalog reads it.
+    let mut new_entry = serde_json::json!({
+        "name": plugin_name,
+        "source": contract_repo,
     });
-    if !already {
-        plugins.push(serde_json::json!({
-            "name": plugin_name,
-            "source": contract_repo,
-        }));
+    if let Some(v) = version {
+        new_entry["version"] = serde_json::Value::String(v.to_string());
+    }
+
+    // Idempotent upsert: replace existing by name, else append. This bumps
+    // the version on re-publish without leaving stale duplicates.
+    if let Some(existing) = plugins.iter_mut().find(|p| {
+        p.get("name").and_then(|x| x.as_str()) == Some(&plugin_name)
+    }) {
+        *existing = new_entry;
+    } else {
+        plugins.push(new_entry);
     }
 
     std::fs::write(&mp_path, serde_json::to_string_pretty(&value)? + "\n")?;
