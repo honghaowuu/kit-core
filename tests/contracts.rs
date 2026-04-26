@@ -139,8 +139,30 @@ fn refresh_catalog_missing_repo_returns_error_envelope() {
     assert!(!out.status.success());
     let v = parse_stdout(&out.stdout);
     assert_eq!(v["ok"], false);
+    assert_eq!(v["error"]["code"], "MARKETPLACE_REPO_MISSING");
+    assert!(v["error"]["hint"].as_str().unwrap().contains("Ask the user"));
     let msg = v["error"]["message"].as_str().unwrap();
     assert!(msg.contains("marketplaceRepo"), "msg: {msg}");
+}
+
+#[test]
+fn refresh_catalog_missing_name_returns_error_envelope() {
+    let work = TempDir::new().unwrap();
+    git_init(work.path());
+
+    let out = kit()
+        .current_dir(work.path())
+        .args([
+            "contracts",
+            "refresh-catalog",
+            "--marketplace-repo",
+            "git@github.com:org/m.git",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let v = parse_stdout(&out.stdout);
+    assert_eq!(v["error"]["code"], "MARKETPLACE_NAME_MISSING");
 }
 
 #[test]
