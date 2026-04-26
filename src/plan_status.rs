@@ -1,11 +1,21 @@
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use pulldown_cmark::{Event, HeadingLevel, Parser as MdParser, Tag, TagEnd};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use crate::git;
+
+/// Snapshot of plan.md state taken at the first `(impl):` commit.
+/// Used to detect mid-flight edits to plan.md that would silently
+/// misalign commit-to-task matching by index.
+#[derive(Serialize, Deserialize, Debug)]
+struct PlanSnapshot {
+    plan_sha256: String,
+    first_impl_sha: String,
+}
 
 #[derive(Parser)]
 pub struct Args {
@@ -31,11 +41,18 @@ struct Output {
     tasks: Vec<Task>,
     next_pending_task_index: Option<usize>,
     recommendation: &'static str,
+    /// True when the plan.md SHA256 differs from the snapshot taken at the
+    /// first `(impl):` commit. When true, commit-to-task matching by index
+    /// is unsafe — the human must reconcile before continuing.
+    plan_edited_mid_flight: bool,
+    /// SHA256 of plan.md at first-impl-commit time, when known.
+    plan_snapshot_sha256: Option<String>,
 }
 
 const REC_NO_PLAN: &str = "no_plan";
 const REC_ALREADY_SYNCED: &str = "already_synced";
 const REC_IMPLEMENT: &str = "implement_from_plan";
+const REC_PLAN_EDITED: &str = "plan_edited_mid_flight";
 
 pub fn run(args: Args) -> Result<ExitCode> {
     let cwd = std::env::current_dir().context("failed to read current dir")?;
@@ -80,8 +97,14 @@ fn compute(cwd: &Path, run_arg: Option<&Path>) -> Result<Output> {
             tasks: Vec::new(),
             next_pending_task_index: None,
             recommendation: REC_NO_PLAN,
+            plan_edited_mid_flight: false,
+            plan_snapshot_sha256: None,
         });
     }
+
+    let plan_sha = sha256_hex(plan_text.as_bytes());
+    let snapshot_path = run_dir.join(".plan-snapshot.json");
+    let prior_snapshot = read_snapshot(&snapshot_path);
 
     // Git data.
     let head_sha = git::rev_parse_head(cwd).ok();
@@ -132,8 +155,31 @@ fn compute(cwd: &Path, run_arg: Option<&Path>) -> Result<Output> {
     let next_pending = tasks.iter().find(|t| !t.completed).map(|t| t.index);
     let all_completed = !tasks.is_empty() && tasks.iter().all(|t| t.completed);
 
-    let recommendation = if tasks.is_empty() {
+    // Take a snapshot at the first impl commit so subsequent runs can detect
+    // mid-flight plan.md edits. Skip when there are no impl commits yet —
+    // pre-impl edits to plan.md are normal.
+    let first_impl_sha = impl_commits.first().map(|(sha, _)| sha.clone());
+    let plan_snapshot_sha256 = match (&prior_snapshot, &first_impl_sha) {
+        (Some(s), _) => Some(s.plan_sha256.clone()),
+        (None, Some(impl_sha)) => {
+            let snap = PlanSnapshot {
+                plan_sha256: plan_sha.clone(),
+                first_impl_sha: impl_sha.clone(),
+            };
+            // Best-effort write — failure to snapshot doesn't break the
+            // primary read-only contract of plan-status.
+            let _ = write_snapshot(&snapshot_path, &snap);
+            Some(plan_sha.clone())
+        }
+        (None, None) => None,
+    };
+    let plan_edited_mid_flight =
+        plan_snapshot_sha256.as_deref().is_some_and(|s| s != plan_sha);
+
+    let mut recommendation = if tasks.is_empty() {
         REC_NO_PLAN
+    } else if plan_edited_mid_flight {
+        REC_PLAN_EDITED
     } else if all_completed {
         REC_ALREADY_SYNCED
     } else {
@@ -143,6 +189,13 @@ fn compute(cwd: &Path, run_arg: Option<&Path>) -> Result<Output> {
     // If no_plan, drop tasks per PRD.
     if recommendation == REC_NO_PLAN {
         tasks.clear();
+    }
+
+    // Don't recommend a next task when we can't trust commit-to-task indexing.
+    if recommendation == REC_PLAN_EDITED {
+        // tasks stay populated — the human needs to see what's there to reconcile.
+        // But next_pending_task_index is suppressed below.
+        let _ = &mut recommendation; // explicit no-op for clarity
     }
 
     Ok(Output {
@@ -157,7 +210,26 @@ fn compute(cwd: &Path, run_arg: Option<&Path>) -> Result<Output> {
             None
         },
         recommendation,
+        plan_edited_mid_flight,
+        plan_snapshot_sha256,
     })
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut h = Sha256::new();
+    h.update(bytes);
+    format!("{:x}", h.finalize())
+}
+
+fn read_snapshot(path: &Path) -> Option<PlanSnapshot> {
+    let text = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+fn write_snapshot(path: &Path, snap: &PlanSnapshot) -> Result<()> {
+    let json = serde_json::to_vec_pretty(snap)?;
+    std::fs::write(path, json).with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
 }
 
 fn no_plan(run: Option<String>) -> Output {
@@ -169,6 +241,8 @@ fn no_plan(run: Option<String>) -> Output {
         tasks: Vec::new(),
         next_pending_task_index: None,
         recommendation: REC_NO_PLAN,
+        plan_edited_mid_flight: false,
+        plan_snapshot_sha256: None,
     }
 }
 
