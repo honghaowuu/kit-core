@@ -2,6 +2,7 @@ use clap::{Parser, Subcommand};
 use std::process::ExitCode;
 
 mod contract;
+mod contracts;
 mod envelope;
 mod git;
 mod lockfile;
@@ -28,6 +29,9 @@ enum Cmd {
     /// Contract subcommands.
     #[command(subcommand)]
     Contract(contract::ContractCmd),
+    /// Marketplace catalog refresh + plugin install.
+    #[command(subcommand)]
+    Contracts(contracts::ContractsCmd),
 }
 
 fn main() -> ExitCode {
@@ -37,6 +41,7 @@ fn main() -> ExitCode {
         Cmd::PluginStatus(args) => plugin_status::run(args),
         Cmd::Scenarios(cmd) => scenarios::run(cmd),
         Cmd::Contract(cmd) => contract::run(cmd),
+        Cmd::Contracts(cmd) => contracts::run(cmd),
     };
     match result {
         Ok(code) => code,
