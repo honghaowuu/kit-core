@@ -161,8 +161,7 @@ pub fn publish(service: &str, confirmed: bool, no_commit: bool) -> Result<ExitCo
             ],
             would_commit,
         };
-        println!("{}", serde_json::to_string_pretty(&out)?);
-        return Ok(ExitCode::SUCCESS);
+        crate::envelope::print_ok(serde_json::to_value(&out)?);
     }
 
     // Step 4: confirmed
@@ -261,6 +260,16 @@ pub fn publish(service: &str, confirmed: bool, no_commit: bool) -> Result<ExitCo
         }
     }
 
+    if !blocking.is_empty() {
+        let prefix = if contract_pushed {
+            "contract publish failed after partial push"
+        } else {
+            "contract publish failed"
+        };
+        let msg = format!("{}: {}", prefix, blocking.join("; "));
+        crate::envelope::print_err(&msg, None);
+    }
+
     let out = ConfirmedOut {
         service,
         confirmed: true,
@@ -278,12 +287,7 @@ pub fn publish(service: &str, confirmed: bool, no_commit: bool) -> Result<ExitCo
         blocking_errors: blocking.clone(),
         already_committed,
     };
-    println!("{}", serde_json::to_string_pretty(&out)?);
-
-    if !blocking.is_empty() {
-        return Ok(ExitCode::from(1));
-    }
-    Ok(ExitCode::SUCCESS)
+    crate::envelope::print_ok(serde_json::to_value(&out)?)
 }
 
 fn collect_stage_files(stage: &Path) -> Result<Vec<PathBuf>> {

@@ -84,6 +84,9 @@ fn sync_missing_spec_exits_one() {
     let tmp = TempDir::new().unwrap();
     let out = kit().current_dir(tmp.path()).args(["scenarios", "sync", "billing"]).output().unwrap();
     assert!(!out.status.success());
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], false);
+    assert!(v["error"]["message"].as_str().unwrap().contains("api-spec.yaml"));
 }
 
 #[test]
@@ -100,6 +103,7 @@ fn skip_records_idempotently() {
         .unwrap();
     assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], true);
     assert_eq!(v["already_present"], false);
     assert_eq!(v["endpoint"], "POST /invoices/bulk");
 
@@ -110,6 +114,7 @@ fn skip_records_idempotently() {
         .output()
         .unwrap();
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], true);
     assert_eq!(v["already_present"], true);
 
     // File contains exactly one entry.
@@ -131,4 +136,6 @@ fn skip_unknown_id_exits_one() {
         .output()
         .unwrap();
     assert!(!out.status.success());
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], false);
 }

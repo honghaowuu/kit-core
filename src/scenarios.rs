@@ -119,7 +119,12 @@ pub fn sync(domain: &str) -> Result<ExitCode> {
         n_added, n_present, orphan_count
     );
 
-    Ok(ExitCode::SUCCESS)
+    crate::envelope::print_ok(serde_json::json!({
+        "domain": domain,
+        "added": n_added,
+        "already_present": n_present,
+        "orphaned": orphan_count,
+    }))
 }
 
 pub fn skip(run_dir: &Path, domain: &str, id: &str) -> Result<ExitCode> {
@@ -174,17 +179,13 @@ pub fn skip(run_dir: &Path, domain: &str, id: &str) -> Result<ExitCode> {
         std::fs::write(&skipped_path, format!("{}\n", pretty))?;
     }
 
-    println!(
-        "{}",
-        serde_json::json!({
-            "domain": domain,
-            "endpoint": entry.endpoint,
-            "id": id,
-            "already_present": already,
-            "path": skipped_path.display().to_string(),
-        })
-    );
-    Ok(ExitCode::SUCCESS)
+    crate::envelope::print_ok(serde_json::json!({
+        "domain": domain,
+        "endpoint": entry.endpoint,
+        "id": id,
+        "already_present": already,
+        "path": skipped_path.display().to_string(),
+    }))
 }
 
 fn write_scenarios_yaml(path: &Path, entries: &[ScenarioEntry]) -> Result<()> {

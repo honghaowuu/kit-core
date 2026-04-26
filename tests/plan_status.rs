@@ -18,6 +18,7 @@ fn no_jkit_dir_returns_no_plan() {
     let out = kit().current_dir(tmp.path()).args(["plan-status"]).output().unwrap();
     assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     let v = parse_stdout(&out.stdout);
+    assert_eq!(v["ok"], true);
     assert_eq!(v["recommendation"], "no_plan");
     assert!(v["tasks"].as_array().unwrap().is_empty());
 }
@@ -32,6 +33,7 @@ fn plan_with_no_tasks_heading_returns_no_plan() {
     let out = kit().current_dir(tmp.path()).args(["plan-status"]).output().unwrap();
     assert!(out.status.success());
     let v = parse_stdout(&out.stdout);
+    assert_eq!(v["ok"], true);
     assert_eq!(v["recommendation"], "no_plan");
 }
 
@@ -49,6 +51,7 @@ fn plan_with_tasks_no_impl_commits_marks_all_pending() {
     let out = kit().current_dir(tmp.path()).args(["plan-status"]).output().unwrap();
     assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     let v = parse_stdout(&out.stdout);
+    assert_eq!(v["ok"], true);
     assert_eq!(v["recommendation"], "implement_from_plan");
     assert_eq!(v["tasks"].as_array().unwrap().len(), 2);
     assert_eq!(v["tasks"][0]["title"], "First task");
@@ -75,6 +78,7 @@ fn impl_commits_advance_completed_state() {
     let out = kit().current_dir(tmp.path()).args(["plan-status"]).output().unwrap();
     assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     let v = parse_stdout(&out.stdout);
+    assert_eq!(v["ok"], true);
     assert_eq!(v["recommendation"], "implement_from_plan");
     assert_eq!(v["tasks"][0]["completed"], true);
     assert_eq!(v["tasks"][1]["completed"], true);
@@ -100,6 +104,7 @@ fn already_synced_when_all_tasks_have_impl_commits() {
     let out = kit().current_dir(tmp.path()).args(["plan-status"]).output().unwrap();
     assert!(out.status.success());
     let v = parse_stdout(&out.stdout);
+    assert_eq!(v["ok"], true);
     assert_eq!(v["recommendation"], "already_synced");
     assert_eq!(v["tasks"][0]["completed"], true);
     assert_eq!(v["tasks"][1]["completed"], true);
@@ -118,4 +123,7 @@ fn run_arg_invalid_exits_non_zero() {
         .output()
         .unwrap();
     assert!(!out.status.success());
+    let v = parse_stdout(&out.stdout);
+    assert_eq!(v["ok"], false);
+    assert!(v["error"]["message"].as_str().unwrap().contains("run dir not found"));
 }

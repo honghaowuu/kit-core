@@ -19,6 +19,7 @@ fn missing_plugin_returns_installed_false() {
         .unwrap();
     assert!(out.status.success());
     let v = parse_stdout(&out.stdout);
+    assert_eq!(v["ok"], true);
     assert_eq!(v["installed"], false);
     assert_eq!(v["plugin_name"], "billing");
 }
@@ -53,6 +54,7 @@ fn project_level_plugin_with_full_metadata() {
             .unwrap();
         assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
         let v = parse_stdout(&out.stdout);
+        assert_eq!(v["ok"], true);
         assert_eq!(v["installed"], true);
         assert_eq!(v["plugin_version"], "1.0.0");
         assert_eq!(v["skill_name"], "billing");
@@ -89,6 +91,7 @@ fn project_level_wins_over_user_level() {
         .unwrap();
     assert!(out.status.success());
     let v = parse_stdout(&out.stdout);
+    assert_eq!(v["ok"], true);
     assert_eq!(v["plugin_version"], "2.0.0");
     let warnings = v["warnings"].as_array().unwrap();
     assert!(warnings.iter().any(|w| w.as_str().unwrap().contains("duplicate")));
@@ -115,6 +118,7 @@ fn repository_and_bugs_fields_surface_urls() {
         .unwrap();
     assert!(out.status.success());
     let v = parse_stdout(&out.stdout);
+    assert_eq!(v["ok"], true);
     assert_eq!(v["repo_url"], "https://github.com/acme/billing-contract");
     assert_eq!(v["issues_url"], "https://acme.example.com/tickets/billing");
 }
@@ -139,6 +143,7 @@ fn issues_url_derived_from_github_repo_when_bugs_absent() {
         .unwrap();
     assert!(out.status.success());
     let v = parse_stdout(&out.stdout);
+    assert_eq!(v["ok"], true);
     assert_eq!(v["repo_url"], "https://github.com/acme/billing-contract");
     assert_eq!(v["issues_url"], "https://github.com/acme/billing-contract/issues");
 }
@@ -163,6 +168,7 @@ fn no_issues_url_for_non_github_repo_when_bugs_absent() {
         .unwrap();
     assert!(out.status.success());
     let v = parse_stdout(&out.stdout);
+    assert_eq!(v["ok"], true);
     assert_eq!(v["repo_url"], "https://gitlab.example.com/acme/billing-contract");
     assert!(v["issues_url"].is_null());
 }
@@ -184,6 +190,7 @@ fn missing_contract_yaml_surfaces_warning() {
         .unwrap();
     assert!(out.status.success());
     let v = parse_stdout(&out.stdout);
+    assert_eq!(v["ok"], true);
     assert!(v["contract_yaml_path"].is_null());
     let warnings = v["warnings"].as_array().unwrap();
     assert!(warnings

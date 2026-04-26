@@ -40,8 +40,7 @@ pub fn run(args: Args) -> Result<ExitCode> {
     let cwd = std::env::current_dir().context("failed to read current dir")?;
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let out = compute(&cwd, home.as_deref(), &args.plugin_name)?;
-    println!("{}", serde_json::to_string_pretty(&out)?);
-    Ok(ExitCode::SUCCESS)
+    crate::envelope::print_ok(serde_json::to_value(&out)?)
 }
 
 fn compute(cwd: &Path, home: Option<&Path>, name: &str) -> Result<Output> {
