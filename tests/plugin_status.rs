@@ -22,6 +22,57 @@ fn missing_plugin_returns_installed_false() {
     assert_eq!(v["ok"], true);
     assert_eq!(v["installed"], false);
     assert_eq!(v["plugin_name"], "billing");
+    assert_eq!(v["drift_status"], "unknown");
+}
+
+#[test]
+fn drift_status_behind_when_catalog_has_newer_version() {
+    let tmp = TempDir::new().unwrap();
+    let plugin_root = ".claude/plugins/billing-contract";
+    write(
+        tmp.path(),
+        &format!("{}/.claude-plugin/plugin.json", plugin_root),
+        r#"{"name": "billing-contract", "version": "1.0.0", "skills": ["billing"]}"#,
+    );
+    write(
+        tmp.path(),
+        ".jkit/marketplace-catalog.json",
+        r#"{"marketplaceName":"x","updatedAt":"x","contracts":[{"name":"billing-contract","description":"","latest_version":"1.5.0"}]}"#,
+    );
+
+    let out = kit()
+        .current_dir(tmp.path())
+        .env("HOME", tmp.path())
+        .args(["plugin-status", "billing"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let v = parse_stdout(&out.stdout);
+    assert_eq!(v["plugin_version"], "1.0.0");
+    assert_eq!(v["latest_version"], "1.5.0");
+    assert_eq!(v["drift_status"], "behind");
+}
+
+#[test]
+fn drift_status_unknown_when_catalog_missing() {
+    let tmp = TempDir::new().unwrap();
+    let plugin_root = ".claude/plugins/billing-contract";
+    write(
+        tmp.path(),
+        &format!("{}/.claude-plugin/plugin.json", plugin_root),
+        r#"{"name": "billing-contract", "version": "1.0.0", "skills": ["billing"]}"#,
+    );
+
+    let out = kit()
+        .current_dir(tmp.path())
+        .env("HOME", tmp.path())
+        .args(["plugin-status", "billing"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v = parse_stdout(&out.stdout);
+    assert_eq!(v["drift_status"], "unknown");
+    assert!(v.get("latest_version").is_none(), "latest_version should be omitted when unknown");
 }
 
 #[test]

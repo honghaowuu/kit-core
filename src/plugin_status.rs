@@ -28,6 +28,16 @@ struct Output {
     installed: bool,
     plugin_path: Option<String>,
     plugin_version: Option<String>,
+    /// Latest version per .jkit/marketplace-catalog.json. None when the
+    /// catalog is missing, when the plugin isn't listed there, or when
+    /// the catalog entry pre-dates F.2 (no `latest_version` field).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    latest_version: Option<String>,
+    /// Drift between installed plugin_version and catalog's latest_version:
+    /// "current" / "behind" / "ahead" / "unknown". `unknown` when either
+    /// side is missing or unparseable. Skill consumers may treat `ahead`
+    /// the same as `current` (informational only).
+    drift_status: &'static str,
     skill_name: Option<String>,
     contract_yaml_path: Option<String>,
     sdk: Option<Sdk>,
@@ -65,6 +75,8 @@ fn compute(cwd: &Path, home: Option<&Path>, name: &str) -> Result<Output> {
             installed: false,
             plugin_path: None,
             plugin_version: None,
+            latest_version: None,
+            drift_status: "unknown",
             skill_name: None,
             contract_yaml_path: None,
             sdk: None,
@@ -165,11 +177,19 @@ fn compute(cwd: &Path, home: Option<&Path>, name: &str) -> Result<Output> {
         None
     };
 
+    // Drift detection: read latest_version from local marketplace-catalog.json
+    // (populated by `kit contracts refresh-catalog`, F.2) and compare to the
+    // installed plugin_version. Best-effort: missing catalog → unknown.
+    let latest_version = lookup_latest_version(cwd, &resolved_name);
+    let drift_status = compute_drift(plugin_version.as_deref(), latest_version.as_deref());
+
     Ok(Output {
         plugin_name: resolved_name,
         installed: true,
         plugin_path: Some(display_path(cwd, &plugin_path)),
         plugin_version,
+        latest_version,
+        drift_status,
         skill_name,
         contract_yaml_path,
         sdk,
@@ -177,6 +197,54 @@ fn compute(cwd: &Path, home: Option<&Path>, name: &str) -> Result<Output> {
         issues_url,
         warnings,
     })
+}
+
+fn lookup_latest_version(cwd: &Path, plugin_name: &str) -> Option<String> {
+    let catalog_path = cwd.join(".jkit").join("marketplace-catalog.json");
+    let raw = std::fs::read_to_string(&catalog_path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let contracts = v.get("contracts")?.as_array()?;
+    let entry = contracts
+        .iter()
+        .find(|c| c.get("name").and_then(|x| x.as_str()) == Some(plugin_name))?;
+    entry
+        .get("latest_version")
+        .and_then(|x| x.as_str())
+        .map(String::from)
+}
+
+/// Compare two version strings. Parses dotted-numeric segments
+/// (e.g. "1.2.3") and short-circuits to string equality otherwise.
+/// Returns "current" / "behind" / "ahead" / "unknown".
+fn compute_drift(installed: Option<&str>, latest: Option<&str>) -> &'static str {
+    match (installed, latest) {
+        (Some(i), Some(l)) => match cmp_versions(i, l) {
+            Some(std::cmp::Ordering::Equal) => "current",
+            Some(std::cmp::Ordering::Less) => "behind",
+            Some(std::cmp::Ordering::Greater) => "ahead",
+            None => {
+                if i == l {
+                    "current"
+                } else {
+                    "unknown"
+                }
+            }
+        },
+        _ => "unknown",
+    }
+}
+
+/// Numeric-segment version comparison. Splits on '.', parses each segment
+/// as u64; returns None if any segment fails to parse (caller falls back).
+/// Pre-release suffixes (1.0.0-alpha) are treated as None — the caller
+/// then falls back to string equality, which is conservative.
+fn cmp_versions(a: &str, b: &str) -> Option<std::cmp::Ordering> {
+    let parse = |s: &str| -> Option<Vec<u64>> {
+        s.split('.').map(|p| p.parse::<u64>().ok()).collect()
+    };
+    let av = parse(a)?;
+    let bv = parse(b)?;
+    Some(av.cmp(&bv))
 }
 
 /// Extract a URL from a JSON field that may be either a bare string
@@ -335,5 +403,21 @@ mod tests {
         let sdk = parse_sdk_block(md, &mut w);
         assert!(!sdk.present);
         assert!(w.is_empty());
+    }
+
+    #[test]
+    fn drift_status_table() {
+        assert_eq!(compute_drift(Some("1.0.0"), Some("1.0.0")), "current");
+        assert_eq!(compute_drift(Some("1.0.0"), Some("1.5.0")), "behind");
+        assert_eq!(compute_drift(Some("2.0.0"), Some("1.5.0")), "ahead");
+        assert_eq!(compute_drift(Some("1.0.0"), None), "unknown");
+        assert_eq!(compute_drift(None, Some("1.0.0")), "unknown");
+        assert_eq!(compute_drift(None, None), "unknown");
+        // Pre-release suffix: cmp_versions returns None, fallback to string.
+        assert_eq!(compute_drift(Some("1.0.0-alpha"), Some("1.0.0-alpha")), "current");
+        assert_eq!(compute_drift(Some("1.0.0-alpha"), Some("1.0.0-beta")), "unknown");
+        // Numeric-segment comparison handles uneven length.
+        assert_eq!(compute_drift(Some("1.10.0"), Some("1.2.0")), "ahead");
+        assert_eq!(compute_drift(Some("1.2"), Some("1.2.1")), "behind");
     }
 }
