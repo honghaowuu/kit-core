@@ -29,9 +29,11 @@ fn contract_json_missing_fields_lists_them() {
         .output()
         .unwrap();
     assert!(!out.status.success());
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("marketplaceRepo"));
-    assert!(stderr.contains("marketplaceName"));
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], false);
+    let msg = v["error"]["message"].as_str().unwrap();
+    assert!(msg.contains("marketplaceRepo"), "msg: {msg}");
+    assert!(msg.contains("marketplaceName"), "msg: {msg}");
 }
 
 #[test]
@@ -89,6 +91,7 @@ fn dry_run_emits_planned_actions_without_pushing() {
         .unwrap();
     assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], true);
     assert_eq!(v["confirmed"], false);
     assert_eq!(v["service"], "billing");
     let pushed = v["would_push_files"].as_array().unwrap();
@@ -122,5 +125,6 @@ fn dry_run_no_commit_omits_commit_plan() {
         .unwrap();
     assert!(out.status.success());
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], true);
     assert!(v["would_commit"].as_array().unwrap().is_empty());
 }

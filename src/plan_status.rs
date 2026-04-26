@@ -40,8 +40,7 @@ const REC_IMPLEMENT: &str = "implement_from_plan";
 pub fn run(args: Args) -> Result<ExitCode> {
     let cwd = std::env::current_dir().context("failed to read current dir")?;
     let output = compute(&cwd, args.run.as_deref())?;
-    println!("{}", serde_json::to_string_pretty(&output)?);
-    Ok(ExitCode::SUCCESS)
+    crate::envelope::print_ok(serde_json::to_value(&output)?)
 }
 
 fn compute(cwd: &Path, run_arg: Option<&Path>) -> Result<Output> {

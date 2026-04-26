@@ -2,7 +2,9 @@ use clap::{Parser, Subcommand};
 use std::process::ExitCode;
 
 mod contract;
+mod envelope;
 mod git;
+mod lockfile;
 mod plan_status;
 mod plugin_status;
 mod scenarios;
@@ -38,9 +40,6 @@ fn main() -> ExitCode {
     };
     match result {
         Ok(code) => code,
-        Err(err) => {
-            eprintln!("kit: {err:#}");
-            ExitCode::from(1)
-        }
+        Err(err) => envelope::print_err(&format!("{err:#}"), None),
     }
 }

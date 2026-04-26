@@ -161,8 +161,7 @@ pub fn publish(service: &str, confirmed: bool, no_commit: bool) -> Result<ExitCo
             ],
             would_commit,
         };
-        println!("{}", serde_json::to_string_pretty(&out)?);
-        return Ok(ExitCode::SUCCESS);
+        crate::envelope::print_ok(serde_json::to_value(&out)?);
     }
 
     // Step 4: confirmed
@@ -195,12 +194,20 @@ pub fn publish(service: &str, confirmed: bool, no_commit: bool) -> Result<ExitCo
                 if let Err(e) = run_claude_marketplace_update(&marketplace_name) {
                     blocking.push(format!("`claude plugin marketplace update` failed: {}", e));
                 }
-                // 4d. Write catalog.
-                let cp = cwd.join(".jkit").join("marketplace-catalog.json");
-                if let Err(e) = std::fs::write(
-                    &cp,
-                    serde_json::to_string_pretty(&catalog)? + "\n",
-                ) {
+                // 4d. Write catalog. Lock `.jkit/` so two concurrent
+                // `kit contract publish` invocations can't lose each other's
+                // catalog updates; atomic_write guarantees readers never see
+                // a half-written file.
+                let jkit_dir = cwd.join(".jkit");
+                let cp = jkit_dir.join("marketplace-catalog.json");
+                let lock_result = crate::lockfile::lock_file_in(&jkit_dir, "marketplace-catalog");
+                let write_result = lock_result.and_then(|_lock| {
+                    crate::lockfile::atomic_write(
+                        &cp,
+                        (serde_json::to_string_pretty(&catalog)? + "\n").as_bytes(),
+                    )
+                });
+                if let Err(e) = write_result {
                     blocking.push(format!("failed to write catalog: {}", e));
                 } else {
                     catalog_path = Some(cp);
@@ -261,6 +268,16 @@ pub fn publish(service: &str, confirmed: bool, no_commit: bool) -> Result<ExitCo
         }
     }
 
+    if !blocking.is_empty() {
+        let prefix = if contract_pushed {
+            "contract publish failed after partial push"
+        } else {
+            "contract publish failed"
+        };
+        let msg = format!("{}: {}", prefix, blocking.join("; "));
+        crate::envelope::print_err(&msg, None);
+    }
+
     let out = ConfirmedOut {
         service,
         confirmed: true,
@@ -278,12 +295,7 @@ pub fn publish(service: &str, confirmed: bool, no_commit: bool) -> Result<ExitCo
         blocking_errors: blocking.clone(),
         already_committed,
     };
-    println!("{}", serde_json::to_string_pretty(&out)?);
-
-    if !blocking.is_empty() {
-        return Ok(ExitCode::from(1));
-    }
-    Ok(ExitCode::SUCCESS)
+    crate::envelope::print_ok(serde_json::to_value(&out)?)
 }
 
 fn collect_stage_files(stage: &Path) -> Result<Vec<PathBuf>> {
@@ -462,14 +474,17 @@ fn run_claude_marketplace_update(name: &str) -> Result<()> {
             "`claude` CLI not on PATH — install with `npm install -g @anthropic-ai/claude-code`"
         ));
     }
-    let st = Command::new("claude")
+    let out = Command::new("claude")
         .args(["plugin", "marketplace", "update", name])
-        .status()
+        .output()
         .context("failed to invoke `claude plugin marketplace update`")?;
-    if !st.success() {
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
         return Err(anyhow!(
-            "`claude plugin marketplace update {}` exited non-zero",
-            name
+            "`claude plugin marketplace update {}` exited {}: {}",
+            name,
+            out.status.code().map(|c| c.to_string()).unwrap_or_else(|| "killed".into()),
+            if stderr.is_empty() { "(no stderr)" } else { &stderr }
         ));
     }
     Ok(())
@@ -491,13 +506,16 @@ fn stage_and_commit(cwd: &Path, paths: &[PathBuf], subject: &str) -> Result<()> 
     for p in paths {
         args.push(p.to_string_lossy().to_string());
     }
-    let st = Command::new("git")
+    let out = Command::new("git")
         .current_dir(cwd)
         .args(&args)
-        .status()
+        .output()
         .context("git add failed")?;
-    if !st.success() {
-        return Err(anyhow!("git add failed"));
+    if !out.status.success() {
+        return Err(anyhow!(
+            "git add failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
     }
 
     // If nothing was staged (paths are unchanged), skip the commit.
@@ -506,26 +524,35 @@ fn stage_and_commit(cwd: &Path, paths: &[PathBuf], subject: &str) -> Result<()> 
         return Ok(());
     }
 
-    let st = Command::new("git")
+    let out = Command::new("git")
         .current_dir(cwd)
         .args(["commit", "-q", "-m", subject])
-        .status()
+        .output()
         .context("git commit failed")?;
-    if !st.success() {
-        return Err(anyhow!("git commit failed for '{}'", subject));
+    if !out.status.success() {
+        return Err(anyhow!(
+            "git commit failed for '{}': {}",
+            subject,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
     }
     Ok(())
 }
 
 fn run_or_err(cwd: &Path, args: &[&str]) -> Result<()> {
-    let st = Command::new("git")
+    let out = Command::new("git")
         .current_dir(cwd)
         .args(args)
         .stdin(Stdio::null())
-        .status()
+        .output()
         .context("git invocation failed")?;
-    if !st.success() {
-        return Err(anyhow!("git {:?} failed in {}", args, cwd.display()));
+    if !out.status.success() {
+        return Err(anyhow!(
+            "git {:?} failed in {}: {}",
+            args,
+            cwd.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
     }
     Ok(())
 }
