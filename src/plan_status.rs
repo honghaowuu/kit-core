@@ -111,22 +111,25 @@ fn compute(cwd: &Path, run_arg: Option<&Path>) -> Result<Output> {
     let baseline_sha =
         git::first_commit_for_path(cwd, &rel(cwd, &plan_path)).unwrap_or(None);
 
-    // Walk impl commits.
-    let impl_commits = if let Some(head) = head_sha.as_deref() {
+    // Walk impl + complete commits.
+    let (impl_commits, has_complete_commit) = if let Some(head) = head_sha.as_deref() {
         let from = baseline_sha.as_deref();
         let subjects = git::commit_subjects(cwd, from, head).unwrap_or_default();
         // The baseline commit itself shouldn't be counted (it introduces plan.md).
         // `from..to` already excludes `from`, so we're fine.
-        subjects
-            .into_iter()
+        let impls: Vec<_> = subjects
+            .iter()
             .filter(|(_, subj)| is_impl_subject(subj))
-            .collect::<Vec<_>>()
+            .cloned()
+            .collect();
+        let has_complete = subjects.iter().any(|(_, subj)| is_complete_subject(subj));
+        (impls, has_complete)
     } else {
-        Vec::new()
+        (Vec::new(), false)
     };
 
     let n_tasks = parsed.tasks.len();
-    if impl_commits.len() > n_tasks && n_tasks > 0 {
+    if !has_complete_commit && impl_commits.len() > n_tasks && n_tasks > 0 {
         eprintln!(
             "plan-status: {} impl commits exceed {} plan tasks; tail commits ignored",
             impl_commits.len(),
@@ -134,14 +137,29 @@ fn compute(cwd: &Path, run_arg: Option<&Path>) -> Result<Output> {
         );
     }
 
+    // A `chore(complete):` commit signals the chain endpoint closed the run.
+    // When the chain endpoint produces a single consolidated impl commit
+    // (executing-plans + java-verify Step 6 path), per-task commit-to-index
+    // mapping breaks: there are N tasks but only 1 impl commit. Treat the
+    // complete commit as the authoritative "all tasks done" signal — every
+    // task is completed, and the single impl commit (if any) is attributed
+    // to all of them.
     let mut tasks: Vec<Task> = parsed
         .tasks
         .iter()
         .enumerate()
         .map(|(i, title)| {
-            let (completed, sha) = match impl_commits.get(i) {
-                Some((sha, _)) => (true, Some(sha.clone())),
-                None => (false, None),
+            let (completed, sha) = if has_complete_commit {
+                let sha = impl_commits
+                    .get(i)
+                    .or_else(|| impl_commits.last())
+                    .map(|(s, _)| s.clone());
+                (true, sha)
+            } else {
+                match impl_commits.get(i) {
+                    Some((sha, _)) => (true, Some(sha.clone())),
+                    None => (false, None),
+                }
             };
             Task {
                 index: i,
@@ -261,6 +279,12 @@ fn latest_run_dir(jkit_dir: &Path) -> Result<Option<PathBuf>> {
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
         .map(|e| e.path())
+        .filter(|p| {
+            // Skip the `done` archive folder and `adhoc-*` ephemeral
+            // scenario-tdd runs — neither is an active pipeline run dir.
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            name != "done" && !name.starts_with("adhoc-")
+        })
         .collect();
     entries.sort();
     Ok(entries.pop())
@@ -275,6 +299,10 @@ fn is_impl_subject(s: &str) -> bool {
         }
     }
     false
+}
+
+fn is_complete_subject(s: &str) -> bool {
+    s.trim_start().starts_with("chore(complete):")
 }
 
 struct ParsedPlan {
