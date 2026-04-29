@@ -37,12 +37,15 @@ fn sync_creates_test_scenarios_yaml_when_missing() {
         .unwrap();
     assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
 
-    let yaml = std::fs::read_to_string(tmp.path().join("docs/domains/billing/test-scenarios.yaml")).unwrap();
+    // Output now lives at the top-level docs/test-scenarios.yaml under
+    // domains.billing (flat list, single-API-type domain).
+    let yaml = std::fs::read_to_string(tmp.path().join("docs/test-scenarios.yaml")).unwrap();
     assert!(yaml.contains("happy-path"));
     assert!(yaml.contains("validation-customer-id-missing"));
     assert!(yaml.contains("validation-items-missing"));
     assert!(yaml.contains("auth-missing-token"));
     assert!(yaml.contains("business-duplicate-idempotency-key"));
+    assert!(yaml.contains("billing"));
 
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("added"));
@@ -56,12 +59,12 @@ fn sync_is_append_only_and_idempotent() {
     // First run: creates the file.
     let out = kit().current_dir(tmp.path()).args(["scenarios", "sync", "billing"]).output().unwrap();
     assert!(out.status.success());
-    let first = std::fs::read_to_string(tmp.path().join("docs/domains/billing/test-scenarios.yaml")).unwrap();
+    let first = std::fs::read_to_string(tmp.path().join("docs/test-scenarios.yaml")).unwrap();
 
     // Second run: should not modify the file (no new entries).
     let out = kit().current_dir(tmp.path()).args(["scenarios", "sync", "billing"]).output().unwrap();
     assert!(out.status.success());
-    let second = std::fs::read_to_string(tmp.path().join("docs/domains/billing/test-scenarios.yaml")).unwrap();
+    let second = std::fs::read_to_string(tmp.path().join("docs/test-scenarios.yaml")).unwrap();
     assert_eq!(first, second, "file should be untouched on second run");
 }
 
@@ -69,12 +72,13 @@ fn sync_is_append_only_and_idempotent() {
 fn sync_preserves_human_added_entries() {
     let tmp = TempDir::new().unwrap();
     write(tmp.path(), "docs/domains/billing/api-spec.yaml", SPEC);
-    let custom = "- endpoint: \"POST /invoices/bulk\"\n  id: weird-edge-case\n  description: a thing the spec doesn't capture\n";
-    write(tmp.path(), "docs/domains/billing/test-scenarios.yaml", custom);
+    // Pre-seed the new top-level file with a hand-curated entry.
+    let pre = "domains:\n  billing:\n    - endpoint: \"POST /invoices/bulk\"\n      id: weird-edge-case\n      description: a thing the spec doesn't capture\n";
+    write(tmp.path(), "docs/test-scenarios.yaml", pre);
 
     let out = kit().current_dir(tmp.path()).args(["scenarios", "sync", "billing"]).output().unwrap();
     assert!(out.status.success());
-    let yaml = std::fs::read_to_string(tmp.path().join("docs/domains/billing/test-scenarios.yaml")).unwrap();
+    let yaml = std::fs::read_to_string(tmp.path().join("docs/test-scenarios.yaml")).unwrap();
     assert!(yaml.contains("weird-edge-case"));
     assert!(yaml.contains("happy-path"));
 }

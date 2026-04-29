@@ -68,7 +68,6 @@ const API_TYPES: &[&str] = &["web-api", "microservice-api", "open-api"];
 struct DomainBucket {
     api_type: Option<String>, // None for flat layout
     spec_path: PathBuf,
-    scen_path: PathBuf,
 }
 
 fn buckets_for(domain_dir: &Path) -> Vec<DomainBucket> {
@@ -80,7 +79,6 @@ fn buckets_for(domain_dir: &Path) -> Vec<DomainBucket> {
             multi.push(DomainBucket {
                 api_type: Some((*ty).to_string()),
                 spec_path: spec,
-                scen_path: sub.join("test-scenarios.yaml"),
             });
         }
     }
@@ -90,7 +88,6 @@ fn buckets_for(domain_dir: &Path) -> Vec<DomainBucket> {
     vec![DomainBucket {
         api_type: None,
         spec_path: domain_dir.join("api-spec.yaml"),
-        scen_path: domain_dir.join("test-scenarios.yaml"),
     }]
 }
 
@@ -100,7 +97,8 @@ pub fn sync(domain: &str) -> Result<ExitCode> {
     let buckets = buckets_for(&domain_dir);
 
     // Refuse if the only bucket is flat and its spec doesn't exist — caller
-    // is misusing the command.
+    // is misusing the command. (api-spec.yaml input still comes from the
+    // legacy per-domain location until the proposed-api.yaml input mode lands.)
     if buckets.len() == 1 && buckets[0].api_type.is_none() && !buckets[0].spec_path.is_file() {
         return Err(anyhow!(
             "missing api-spec.yaml at {} — neither flat nor any per-type subdir found",
@@ -109,6 +107,7 @@ pub fn sync(domain: &str) -> Result<ExitCode> {
     }
 
     let multi_type = buckets.len() > 1 || buckets[0].api_type.is_some();
+    let mut scenarios_file = crate::scenarios_yaml::ScenariosFile::load(&cwd)?;
     let mut per_type_results: Vec<serde_json::Value> = Vec::new();
     let mut total_added = 0usize;
     let mut total_present = 0usize;
@@ -116,8 +115,6 @@ pub fn sync(domain: &str) -> Result<ExitCode> {
 
     for bucket in &buckets {
         if !bucket.spec_path.is_file() {
-            // Multi-type bucket without spec — should be impossible since
-            // buckets_for filters on spec presence, but guard anyway.
             continue;
         }
 
@@ -132,31 +129,44 @@ pub fn sync(domain: &str) -> Result<ExitCode> {
 
         let derived = derive_scenarios(&spec);
 
-        let existing: Vec<ScenarioEntry> = if bucket.scen_path.is_file() {
-            let raw = std::fs::read_to_string(&bucket.scen_path)
-                .with_context(|| format!("failed to read {}", bucket.scen_path.display()))?;
-            if raw.trim().is_empty() {
-                Vec::new()
-            } else {
-                serde_yaml::from_str(&raw)
-                    .with_context(|| format!("failed to parse {}", bucket.scen_path.display()))?
-            }
-        } else {
-            Vec::new()
-        };
+        // Existing entries for this (slug, api_type) come from the top-level
+        // file. For multi-type domains we read the per-bucket section; for
+        // single-type we read the flat list.
+        let existing: Vec<crate::scenarios_yaml::ScenarioEntry> =
+            match scenarios_file.section(domain)? {
+                Some(crate::scenarios_yaml::SlugSection::Flat(v)) if bucket.api_type.is_none() => v,
+                Some(crate::scenarios_yaml::SlugSection::PerApiType(buckets_existing)) => {
+                    if let Some(ty) = &bucket.api_type {
+                        buckets_existing
+                            .into_iter()
+                            .find(|(t, _)| t == ty)
+                            .map(|(_, v)| v)
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    }
+                }
+                _ => Vec::new(),
+            };
 
         let existing_keys: BTreeSet<(String, String)> = existing
             .iter()
             .map(|e| (e.endpoint.clone(), e.id.clone()))
             .collect();
 
-        let mut to_append: Vec<ScenarioEntry> = Vec::new();
+        let mut combined: Vec<crate::scenarios_yaml::ScenarioEntry> = existing.clone();
         let mut seen: BTreeSet<(String, String)> = existing_keys.clone();
+        let mut n_added = 0usize;
         for e in derived.iter() {
             let key = (e.endpoint.clone(), e.id.clone());
             if !seen.contains(&key) {
-                to_append.push(e.clone());
+                combined.push(crate::scenarios_yaml::ScenarioEntry {
+                    endpoint: e.endpoint.clone(),
+                    id: e.id.clone(),
+                    description: e.description.clone(),
+                });
                 seen.insert(key);
+                n_added += 1;
             }
         }
 
@@ -179,13 +189,10 @@ pub fn sync(domain: &str) -> Result<ExitCode> {
             }
         }
 
-        let n_added = to_append.len();
         let n_present = derived.len() - n_added;
 
         if n_added > 0 {
-            let mut combined = existing.clone();
-            combined.extend(to_append.into_iter());
-            write_scenarios_yaml(&bucket.scen_path, &combined)?;
+            scenarios_file.put_entries(domain, bucket.api_type.as_deref(), &combined)?;
         }
 
         eprintln!(
@@ -214,6 +221,10 @@ pub fn sync(domain: &str) -> Result<ExitCode> {
         total_orphan += orphan_count;
     }
 
+    if total_added > 0 {
+        scenarios_file.save()?;
+    }
+
     crate::envelope::print_ok(serde_json::json!({
         "domain": domain,
         "multi_type": multi_type,
@@ -221,6 +232,7 @@ pub fn sync(domain: &str) -> Result<ExitCode> {
         "added": total_added,
         "already_present": total_present,
         "orphaned": total_orphan,
+        "scenarios_path": format!("docs/test-scenarios.yaml"),
     }))
 }
 
@@ -239,28 +251,24 @@ pub fn skip(
     if !run.is_dir() {
         return Err(anyhow!("run dir missing: {}", run_dir.display()));
     }
-    let domain_dir = cwd.join("docs").join("domains").join(domain);
-    let buckets = buckets_for(&domain_dir);
 
-    // Find the scenario id across buckets. When multiple buckets match,
-    // require --api-type to disambiguate; refuse to silently pick.
-    let mut matches: Vec<(DomainBucket, ScenarioEntry)> = Vec::new();
-    for bucket in &buckets {
+    let scenarios_file = crate::scenarios_yaml::ScenariosFile::load(&cwd)?;
+    let section = scenarios_file
+        .section(domain)?
+        .ok_or_else(|| anyhow!("domain '{}' has no entry in docs/test-scenarios.yaml", domain))?;
+
+    // Find the scenario id, optionally constrained to one api-type. When
+    // multiple matches exist across api-types, require --api-type to
+    // disambiguate.
+    let mut matches: Vec<(Option<String>, crate::scenarios_yaml::ScenarioEntry)> = Vec::new();
+    for (ty, entry) in section.iter_with_type() {
         if let Some(filter_ty) = api_type {
-            if bucket.api_type.as_deref() != Some(filter_ty) {
+            if ty != Some(filter_ty) {
                 continue;
             }
         }
-        if !bucket.scen_path.is_file() {
-            continue;
-        }
-        let raw = std::fs::read_to_string(&bucket.scen_path)?;
-        if raw.trim().is_empty() {
-            continue;
-        }
-        let entries: Vec<ScenarioEntry> = serde_yaml::from_str(&raw)?;
-        if let Some(entry) = entries.iter().find(|e| e.id == id).cloned() {
-            matches.push((bucket.clone(), entry));
+        if entry.id == id {
+            matches.push((ty.map(str::to_string), entry.clone()));
         }
     }
 
@@ -277,7 +285,7 @@ pub fn skip(
     if matches.len() > 1 {
         let types: Vec<&str> = matches
             .iter()
-            .filter_map(|(b, _)| b.api_type.as_deref())
+            .filter_map(|(t, _)| t.as_deref())
             .collect();
         return Err(anyhow!(
             "scenario id '{}' is ambiguous in domain '{}' across api-types: {} — pass --api-type to disambiguate",
@@ -286,7 +294,7 @@ pub fn skip(
             types.join(", ")
         ));
     }
-    let (bucket, entry) = matches.into_iter().next().unwrap();
+    let (matched_ty, entry) = matches.into_iter().next().unwrap();
 
     let skipped_path = run.join("skipped-scenarios.json");
     let mut current: Vec<serde_json::Value> = if skipped_path.is_file() {
@@ -303,7 +311,7 @@ pub fn skip(
     let already = current.iter().any(|v| {
         v.get("domain").and_then(|x| x.as_str()) == Some(domain)
             && v.get("id").and_then(|x| x.as_str()) == Some(id)
-            && v.get("api_type").and_then(|x| x.as_str()) == bucket.api_type.as_deref()
+            && v.get("api_type").and_then(|x| x.as_str()) == matched_ty.as_deref()
     });
 
     if !already {
@@ -314,7 +322,7 @@ pub fn skip(
             serde_json::Value::String(entry.endpoint.clone()),
         );
         record.insert("id".into(), serde_json::Value::String(id.to_string()));
-        if let Some(ty) = &bucket.api_type {
+        if let Some(ty) = &matched_ty {
             record.insert("api_type".into(), serde_json::Value::String(ty.clone()));
         }
         current.push(serde_json::Value::Object(record));
@@ -329,7 +337,7 @@ pub fn skip(
         serde_json::Value::String(entry.endpoint.clone()),
     );
     response.insert("id".into(), serde_json::Value::String(id.to_string()));
-    if let Some(ty) = &bucket.api_type {
+    if let Some(ty) = &matched_ty {
         response.insert("api_type".into(), serde_json::Value::String(ty.clone()));
     }
     response.insert("already_present".into(), serde_json::json!(already));
@@ -338,52 +346,6 @@ pub fn skip(
         serde_json::Value::String(skipped_path.display().to_string()),
     );
     crate::envelope::print_ok(serde_json::Value::Object(response))
-}
-
-fn write_scenarios_yaml(path: &Path, entries: &[ScenarioEntry]) -> Result<()> {
-    // Render with a blank line between entries to match hand-maintained style.
-    let mut out = String::new();
-    for (i, e) in entries.iter().enumerate() {
-        if i > 0 {
-            out.push('\n');
-        }
-        out.push_str(&format!(
-            "- endpoint: {}\n  id: {}\n  description: {}\n",
-            yaml_scalar(&e.endpoint),
-            yaml_scalar(&e.id),
-            yaml_scalar(&e.description),
-        ));
-    }
-    std::fs::write(path, out)
-        .with_context(|| format!("failed to write {}", path.display()))?;
-    Ok(())
-}
-
-fn yaml_scalar(s: &str) -> String {
-    // Quote when it contains characters that need escaping or starts with a special token.
-    let needs_quote = s.is_empty()
-        || s.contains(':')
-        || s.contains('#')
-        || s.contains('\n')
-        || s.contains('"')
-        || s.starts_with('-')
-        || s.starts_with('?')
-        || s.starts_with('*')
-        || s.starts_with('&')
-        || s.starts_with('!')
-        || s.starts_with('|')
-        || s.starts_with('>')
-        || s.starts_with('@')
-        || s.starts_with('`')
-        || s.starts_with('\'')
-        || s.starts_with(' ')
-        || s.ends_with(' ');
-    if needs_quote {
-        let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
-        format!("\"{}\"", escaped)
-    } else {
-        s.to_string()
-    }
 }
 
 pub fn derive_scenarios(spec: &OpenAPI) -> Vec<ScenarioEntry> {

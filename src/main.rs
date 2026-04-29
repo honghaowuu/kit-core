@@ -9,6 +9,7 @@ mod lockfile;
 mod plan_status;
 mod plugin_status;
 mod scenarios;
+mod scenarios_yaml;
 
 #[derive(Parser)]
 #[command(name = "kit", version, about = "Universal binary used by *kit language plugins")]
