@@ -12,14 +12,31 @@ use std::process::ExitCode;
 
 #[derive(Subcommand)]
 pub enum ScenarioCmd {
-    /// Derive required scenarios from api-spec.yaml; append-only into
-    /// test-scenarios.yaml. Multi-API-type aware: when the domain dir has
-    /// `web-api/` / `microservice-api/` / `open-api/` subdirs with their own
-    /// `api-spec.yaml`, sync runs once per type into the matching per-type
-    /// `test-scenarios.yaml`. Single-type domains stay flat as before.
+    /// Derive required scenarios for a domain and append into top-level
+    /// `docs/test-scenarios.yaml`. Three input modes:
+    ///
+    ///   `--from-code` — runs `jkit api-spec show <slug>` to pull the
+    ///       current code's surface (smartdoc on controllers). Used by
+    ///       /migrate-project for backfill and ad-hoc re-derivation.
+    ///
+    ///   `--proposed <path>` — reads the run's `proposed-api.yaml` (the
+    ///       writing-plans output). Used during the spec-delta /
+    ///       writing-plans phase before code exists.
+    ///
+    ///   default (no flag) — reads `docs/domains/<slug>/api-spec.yaml`.
+    ///       Legacy path; only useful for projects that still have the
+    ///       per-domain layout. Errors when the file is absent.
     Sync {
-        /// Domain name; resolves to docs/domains/<domain>/.
+        /// Domain slug; controls which `domains.<slug>` entry gets the
+        /// derived scenarios.
         domain: String,
+        /// Pull the API surface from live controllers via
+        /// `jkit api-spec show <domain>`.
+        #[arg(long, conflicts_with = "proposed")]
+        from_code: bool,
+        /// Read the API surface from a `proposed-api.yaml` file.
+        #[arg(long, conflicts_with = "from_code")]
+        proposed: Option<PathBuf>,
     },
     /// Record a per-run scenario skip. For multi-API-type domains pass
     /// `--api-type` when the scenario id is ambiguous across types (the
@@ -42,7 +59,15 @@ pub enum ScenarioCmd {
 
 pub fn run(cmd: ScenarioCmd) -> Result<ExitCode> {
     match cmd {
-        ScenarioCmd::Sync { domain } => sync(&domain),
+        ScenarioCmd::Sync {
+            domain,
+            from_code,
+            proposed,
+        } => match (from_code, proposed) {
+            (true, _) => sync_from_code(&domain),
+            (false, Some(path)) => sync_from_proposed(&domain, &path),
+            (false, None) => sync(&domain),
+        },
         ScenarioCmd::Skip {
             run,
             domain,
@@ -50,6 +75,139 @@ pub fn run(cmd: ScenarioCmd) -> Result<ExitCode> {
             api_type,
         } => skip(&run, &domain, &id, api_type.as_deref()),
     }
+}
+
+/// `--from-code` — shell out to `jkit api-spec show <domain>`, parse the
+/// returned `spec` field as OpenAPI, derive scenarios, and append them
+/// under `domains.<slug>` in the top-level `docs/test-scenarios.yaml`
+/// (flat list — controllers within a single slug are treated as one
+/// surface here; multi-type splits happen via separate per-type sync
+/// calls).
+fn sync_from_code(domain: &str) -> Result<ExitCode> {
+    let cwd = std::env::current_dir().context("failed to read current dir")?;
+    let output = std::process::Command::new("jkit")
+        .args(["api-spec", "show", domain])
+        .output()
+        .context("invoking `jkit api-spec show`")?;
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stdout);
+        return Err(anyhow!(
+            "jkit api-spec show {domain} failed: {}",
+            err.trim()
+        ));
+    }
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .context("parsing jkit api-spec show output as JSON")?;
+    if envelope.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+        return Err(anyhow!(
+            "jkit api-spec show {domain} returned ok:false: {}",
+            envelope
+        ));
+    }
+    let spec_value = envelope
+        .get("spec")
+        .ok_or_else(|| anyhow!("jkit api-spec show output missing `spec` field"))?;
+    let spec: OpenAPI = serde_json::from_value(spec_value.clone())
+        .context("parsing api-spec output as OpenAPI 3.x")?;
+    sync_from_spec(&cwd, domain, None, &spec)
+}
+
+/// `--proposed <path>` — load the proposal YAML, derive scenarios,
+/// append under `domains.<slug>`. The proposal is a strict OpenAPI 3.x
+/// subset (writing-plans authors it).
+fn sync_from_proposed(domain: &str, proposed_path: &Path) -> Result<ExitCode> {
+    let cwd = std::env::current_dir().context("failed to read current dir")?;
+    let abs = if proposed_path.is_absolute() {
+        proposed_path.to_path_buf()
+    } else {
+        cwd.join(proposed_path)
+    };
+    if !abs.is_file() {
+        return Err(anyhow!(
+            "proposed-api.yaml not found: {}",
+            proposed_path.display()
+        ));
+    }
+    let text = std::fs::read_to_string(&abs)
+        .with_context(|| format!("reading {}", abs.display()))?;
+    let spec: OpenAPI = serde_yaml::from_str(&text)
+        .with_context(|| format!("parsing {} as OpenAPI 3.x", abs.display()))?;
+    sync_from_spec(&cwd, domain, None, &spec)
+}
+
+/// Shared write path: derive scenarios from a parsed OpenAPI doc and
+/// merge them into `docs/test-scenarios.yaml` under `domains.<domain>`
+/// (or `domains.<domain>.<api_type>` when `api_type` is `Some`).
+fn sync_from_spec(
+    cwd: &Path,
+    domain: &str,
+    api_type: Option<&str>,
+    spec: &OpenAPI,
+) -> Result<ExitCode> {
+    let derived = derive_scenarios(spec);
+
+    let mut scenarios_file = crate::scenarios_yaml::ScenariosFile::load(cwd)?;
+    let existing: Vec<crate::scenarios_yaml::ScenarioEntry> =
+        match scenarios_file.section(domain)? {
+            Some(crate::scenarios_yaml::SlugSection::Flat(v)) if api_type.is_none() => v,
+            Some(crate::scenarios_yaml::SlugSection::PerApiType(buckets)) => {
+                if let Some(ty) = api_type {
+                    buckets
+                        .into_iter()
+                        .find(|(t, _)| t == ty)
+                        .map(|(_, v)| v)
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                }
+            }
+            _ => Vec::new(),
+        };
+
+    let existing_keys: BTreeSet<(String, String)> = existing
+        .iter()
+        .map(|e| (e.endpoint.clone(), e.id.clone()))
+        .collect();
+
+    let mut combined: Vec<crate::scenarios_yaml::ScenarioEntry> = existing.clone();
+    let mut seen: BTreeSet<(String, String)> = existing_keys.clone();
+    let mut n_added = 0usize;
+    for e in derived.iter() {
+        let key = (e.endpoint.clone(), e.id.clone());
+        if !seen.contains(&key) {
+            combined.push(crate::scenarios_yaml::ScenarioEntry {
+                endpoint: e.endpoint.clone(),
+                id: e.id.clone(),
+                description: e.description.clone(),
+            });
+            seen.insert(key);
+            n_added += 1;
+        }
+    }
+
+    let n_present = derived.len().saturating_sub(n_added);
+
+    if n_added > 0 {
+        scenarios_file.put_entries(domain, api_type, &combined)?;
+        scenarios_file.save()?;
+    }
+
+    eprintln!(
+        "sync{}: {} added, {} already present",
+        api_type
+            .map(|t| format!(" [{t}]"))
+            .unwrap_or_default(),
+        n_added,
+        n_present,
+    );
+
+    crate::envelope::print_ok(serde_json::json!({
+        "domain": domain,
+        "api_type": api_type,
+        "added": n_added,
+        "already_present": n_present,
+        "scenarios_path": "docs/test-scenarios.yaml",
+    }))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
