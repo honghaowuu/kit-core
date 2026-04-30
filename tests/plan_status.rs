@@ -113,17 +113,48 @@ fn already_synced_when_all_tasks_have_impl_commits() {
 }
 
 #[test]
+fn single_impl_commit_covers_all_tasks_chain_endpoint() {
+    // Chain-endpoint shape: N plan tasks, 1 consolidated impl commit.
+    // All tasks should mark completed and attribute to that commit.
+    let tmp = TempDir::new().unwrap();
+    git_init(tmp.path());
+    write(
+        tmp.path(),
+        ".jkit/2026-04-25-foo/plan.md",
+        "## Tasks\n\n1. **A** — x\n2. **B** — y\n3. **C** — z\n",
+    );
+    commit_all(tmp.path(), "chore: scaffold plan");
+    write(tmp.path(), "all.txt", "all");
+    commit_all(tmp.path(), "feat(impl): consolidated implementation");
+
+    let out = kit().current_dir(tmp.path()).args(["plan-status"]).output().unwrap();
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let v = parse_stdout(&out.stdout);
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["recommendation"], "already_synced");
+    assert_eq!(v["tasks"][0]["completed"], true);
+    assert_eq!(v["tasks"][1]["completed"], true);
+    assert_eq!(v["tasks"][2]["completed"], true);
+    let sha = v["tasks"][0]["commit_sha"].as_str().unwrap().to_string();
+    assert_eq!(v["tasks"][1]["commit_sha"], sha);
+    assert_eq!(v["tasks"][2]["commit_sha"], sha);
+    assert!(v["next_pending_task_index"].is_null());
+}
+
+#[test]
 fn snapshot_taken_at_first_impl_commit_no_drift() {
     let tmp = TempDir::new().unwrap();
     git_init(tmp.path());
     write(
         tmp.path(),
         ".jkit/2026-04-25-foo/plan.md",
-        "## Tasks\n\n1. **A** — x\n2. **B** — y\n",
+        "## Tasks\n\n1. **A** — x\n2. **B** — y\n3. **C** — z\n",
     );
     commit_all(tmp.path(), "chore: scaffold plan");
     write(tmp.path(), "a.txt", "a");
     commit_all(tmp.path(), "feat(impl): A");
+    write(tmp.path(), "b.txt", "b");
+    commit_all(tmp.path(), "feat(impl): B");
 
     let out = kit().current_dir(tmp.path()).args(["plan-status"]).output().unwrap();
     assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));

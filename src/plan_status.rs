@@ -111,25 +111,23 @@ fn compute(cwd: &Path, run_arg: Option<&Path>) -> Result<Output> {
     let baseline_sha =
         git::first_commit_for_path(cwd, &rel(cwd, &plan_path)).unwrap_or(None);
 
-    // Walk impl + complete commits.
-    let (impl_commits, has_complete_commit) = if let Some(head) = head_sha.as_deref() {
+    // Walk impl commits.
+    let impl_commits: Vec<(String, String)> = if let Some(head) = head_sha.as_deref() {
         let from = baseline_sha.as_deref();
         let subjects = git::commit_subjects(cwd, from, head).unwrap_or_default();
         // The baseline commit itself shouldn't be counted (it introduces plan.md).
         // `from..to` already excludes `from`, so we're fine.
-        let impls: Vec<_> = subjects
+        subjects
             .iter()
             .filter(|(_, subj)| is_impl_subject(subj))
             .cloned()
-            .collect();
-        let has_complete = subjects.iter().any(|(_, subj)| is_complete_subject(subj));
-        (impls, has_complete)
+            .collect()
     } else {
-        (Vec::new(), false)
+        Vec::new()
     };
 
     let n_tasks = parsed.tasks.len();
-    if !has_complete_commit && impl_commits.len() > n_tasks && n_tasks > 0 {
+    if impl_commits.len() > n_tasks && n_tasks > 0 {
         eprintln!(
             "plan-status: {} impl commits exceed {} plan tasks; tail commits ignored",
             impl_commits.len(),
@@ -137,24 +135,20 @@ fn compute(cwd: &Path, run_arg: Option<&Path>) -> Result<Output> {
         );
     }
 
-    // A `chore(complete):` commit signals the chain endpoint closed the run.
-    // When the chain endpoint produces a single consolidated impl commit
-    // (executing-plans + java-verify Step 6 path), per-task commit-to-index
-    // mapping breaks: there are N tasks but only 1 impl commit. Treat the
-    // complete commit as the authoritative "all tasks done" signal — every
-    // task is completed, and the single impl commit (if any) is attributed
-    // to all of them.
+    // Chain-endpoint case: when N>1 plan tasks have a single consolidated
+    // impl commit (executing-plans + java-verify Step 6 path), per-task
+    // index matching would mark only task 0 completed. Treat the single
+    // impl commit as covering every task — all tasks completed, all
+    // attributed to that commit. Falls through to index matching when
+    // impls match tasks 1:1 or partially.
+    let chain_endpoint = impl_commits.len() == 1 && n_tasks > 1;
     let mut tasks: Vec<Task> = parsed
         .tasks
         .iter()
         .enumerate()
         .map(|(i, title)| {
-            let (completed, sha) = if has_complete_commit {
-                let sha = impl_commits
-                    .get(i)
-                    .or_else(|| impl_commits.last())
-                    .map(|(s, _)| s.clone());
-                (true, sha)
+            let (completed, sha) = if chain_endpoint {
+                (true, impl_commits.first().map(|(s, _)| s.clone()))
             } else {
                 match impl_commits.get(i) {
                     Some((sha, _)) => (true, Some(sha.clone())),
@@ -280,10 +274,11 @@ fn latest_run_dir(jkit_dir: &Path) -> Result<Option<PathBuf>> {
         .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
         .map(|e| e.path())
         .filter(|p| {
-            // Skip the `done` archive folder and `adhoc-*` ephemeral
-            // scenario-tdd runs — neither is an active pipeline run dir.
+            // Skip `adhoc-*` ephemeral scenario-tdd runs — not an active
+            // pipeline run dir. (The old `done/` archive folder no longer
+            // exists under the branch-per-feature workflow.)
             let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            name != "done" && !name.starts_with("adhoc-")
+            !name.starts_with("adhoc-")
         })
         .collect();
     entries.sort();
@@ -299,10 +294,6 @@ fn is_impl_subject(s: &str) -> bool {
         }
     }
     false
-}
-
-fn is_complete_subject(s: &str) -> bool {
-    s.trim_start().starts_with("chore(complete):")
 }
 
 struct ParsedPlan {
